@@ -1,10 +1,9 @@
 fastapi
 uvicorn
+gunicorn
 numpy
 scikit-learn
 python-multipart
 pillow
 opencv-python
 tensorflow
-
-# uvicorn app.main:app --reload
