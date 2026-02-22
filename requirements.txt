@@ -2,8 +2,7 @@ fastapi
 uvicorn
 gunicorn
 numpy
-scikit-learn
 python-multipart
 pillow
-opencv-python
-tensorflow
+opencv-python-headless
+tflite-runtime
