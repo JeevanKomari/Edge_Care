@@ -6,3 +6,4 @@ python-multipart
 pillow
 opencv-python-headless
 tflite-runtime==2.14.0
+scikit-learn==1.4.2
