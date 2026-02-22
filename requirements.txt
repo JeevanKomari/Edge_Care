@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 gunicorn
-numpy
+numpy<2
 python-multipart
 pillow
 opencv-python-headless
-tflite-runtime
+tflite-runtime==2.14.0
