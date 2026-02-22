@@ -2,7 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 import cv2
-import tensorflow as tf
+import tflite_runtime.interpreter as tflite
 
 MODEL_PATH = "model/skin_model.tflite"
 
@@ -12,7 +12,7 @@ output_details = None
 
 # Load model ONLY if it exists
 if os.path.exists(MODEL_PATH):
-    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
