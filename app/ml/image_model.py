@@ -35,13 +35,15 @@ except Exception as e:
     print(f"⚠️ Severity model load failed: {e}")
 
 # ============================================================
-# 2) New Disease Name Model (DermNet subset)
+# 2) Disease Model (DermNet subset)
 # ============================================================
 DISEASE_MODEL_PATH = os.path.join(MODEL_DIR, "edgecare_disease_model.tflite")
 DISEASE_LABELS_PATH = os.path.join(MODEL_DIR, "edgecare_disease_labels.json")
 DISEASE_CONFIG_PATH = os.path.join(MODEL_DIR, "edgecare_disease_config.json")
 
-DISEASE_THRESHOLD_DEFAULT = 0.40  # 'No rash / unclear image' gate
+DISEASE_THRESHOLD_DEFAULT = 0.28
+DISEASE_TOP_K_DEFAULT = 3
+MIN_SEVERITY_CONF_DEFAULT = 0.34
 
 disease_interpreter = None
 disease_input_details = None
@@ -49,6 +51,8 @@ disease_output_details = None
 
 disease_class_names = None
 disease_threshold = DISEASE_THRESHOLD_DEFAULT
+disease_top_k = DISEASE_TOP_K_DEFAULT
+min_severity_conf_for_rash = MIN_SEVERITY_CONF_DEFAULT
 
 # Folder-name labels -> clean user-facing names
 DEFAULT_LABEL_MAP = {
@@ -77,7 +81,7 @@ def _safe_load_json(path):
 
 def _init_disease_model():
     global disease_interpreter, disease_input_details, disease_output_details
-    global disease_class_names, disease_threshold, label_map
+    global disease_class_names, disease_threshold, disease_top_k, min_severity_conf_for_rash, label_map
 
     if not os.path.exists(DISEASE_MODEL_PATH):
         print("⚠️ Disease model not found at:", DISEASE_MODEL_PATH)
@@ -94,6 +98,8 @@ def _init_disease_model():
         disease_output_details = None
         disease_class_names = None
         disease_threshold = DISEASE_THRESHOLD_DEFAULT
+        disease_top_k = DISEASE_TOP_K_DEFAULT
+        min_severity_conf_for_rash = MIN_SEVERITY_CONF_DEFAULT
         label_map = DEFAULT_LABEL_MAP.copy()
         print(f"⚠️ Disease model load failed: {e}")
         return
@@ -106,15 +112,32 @@ def _init_disease_model():
         disease_class_names = None
         print("⚠️ Disease labels JSON not found/invalid at:", DISEASE_LABELS_PATH)
 
-    # optional config (threshold + label map)
+    # optional config (threshold, top_k, label map)
     cfg = _safe_load_json(DISEASE_CONFIG_PATH)
     if isinstance(cfg, dict):
         th = cfg.get("threshold")
         if isinstance(th, (int, float)):
             disease_threshold = float(th)
+
+        tk = cfg.get("top_k")
+        if isinstance(tk, int) and tk > 0:
+            disease_top_k = tk
+
+        ms = cfg.get("min_severity_conf_for_rash")
+        if isinstance(ms, (int, float)):
+            min_severity_conf_for_rash = float(ms)
+
+        short_map = cfg.get("label_short_map")
         lm = cfg.get("label_map")
-        if isinstance(lm, dict) and lm:
+        if isinstance(short_map, dict) and short_map:
+            label_map = {**label_map, **short_map}
+        elif isinstance(lm, dict) and lm:
             label_map = {**label_map, **lm}
+
+        # fall back to config classes if labels missing
+        classes_cfg = cfg.get("classes")
+        if disease_class_names is None and isinstance(classes_cfg, list) and classes_cfg:
+            disease_class_names = classes_cfg
 
 
 _init_disease_model()
@@ -173,7 +196,23 @@ def _predict_severity(input_data: np.ndarray):
     }, None
 
 
-def _predict_disease(input_data: np.ndarray):
+def _get_top_predictions(probabilities: np.ndarray, top_k: int):
+    probs = np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    sorted_idx = np.argsort(probs)[::-1][:top_k]
+    preds = []
+    for idx in sorted_idx:
+        score = float(probs[idx])
+        raw_label = (
+            disease_class_names[idx]
+            if disease_class_names and 0 <= idx < len(disease_class_names)
+            else f"class_{idx}"
+        )
+        friendly = label_map.get(raw_label, raw_label)
+        preds.append({"label": raw_label, "name": friendly, "score": round(score, 4)})
+    return preds
+
+
+def _predict_disease(input_data: np.ndarray, severity_max_prob: float):
     if disease_interpreter is None:
         return {
             "status": "disabled",
@@ -191,33 +230,45 @@ def _predict_disease(input_data: np.ndarray):
         }
 
     probs = _softmax_if_needed(raw)
+    top_predictions = _get_top_predictions(probs, disease_top_k)
 
-    idx = int(np.argmax(probs))
-    conf = float(probs[idx])
-
-    raw_label = None
-    if disease_class_names and 0 <= idx < len(disease_class_names):
-        raw_label = disease_class_names[idx]
-    else:
-        raw_label = f"class_{idx}"
-
-    clean_label = label_map.get(raw_label, raw_label)
-
-    # 'No rash / unclear' gate
-    if conf < disease_threshold:
+    if not top_predictions:
         return {
-            "status": "no_rash_detected",
-            "message": "No rash detected or image is unclear. Please upload a clear rash/skin issue photo.",
-            "confidence": round(conf, 4),
-            "best_guess": clean_label,
+            "status": "disabled",
+            "message": "Disease model returned no predictions.",
+        }
+
+    top1 = top_predictions[0]
+    top1_score = float(top1["score"])
+    best_guess = top1["name"]
+    raw_label = top1["label"]
+
+    if top1_score >= disease_threshold:
+        return {
+            "status": "rash_detected",
+            "disease_name": best_guess,
+            "confidence": round(top1_score, 4),
+            "raw_label": raw_label,
+            "top_predictions": top_predictions,
+        }
+
+    if severity_max_prob >= min_severity_conf_for_rash:
+        return {
+            "status": "uncertain",
+            "message": "Rash likely detected but disease type is uncertain. Upload a closer, well-lit photo focused on the affected area.",
+            "best_guess": best_guess,
+            "confidence": round(top1_score, 4),
             "threshold": round(disease_threshold, 4),
+            "top_predictions": top_predictions,
         }
 
     return {
-        "status": "rash_detected",
-        "disease_name": clean_label,
-        "confidence": round(conf, 4),
-        "raw_label": raw_label,
+        "status": "no_rash_detected",
+        "message": "No rash detected or image is unclear. Please upload a clear rash/skin issue photo.",
+        "best_guess": best_guess,
+        "confidence": round(top1_score, 4),
+        "threshold": round(disease_threshold, 4),
+        "top_predictions": top_predictions,
     }
 
 
@@ -236,7 +287,10 @@ def analyze_image(file):
     if severity_err:
         return severity_err
 
-    disease_result = _predict_disease(input_data)
+    severity_probs = severity_result.get("all_probabilities", {})
+    severity_max_prob = max(severity_probs.values()) if severity_probs else 0.0
+
+    disease_result = _predict_disease(input_data, severity_max_prob)
 
     # Backward compatible response + new fields
     resp = dict(severity_result)
