@@ -1,0 +1,32 @@
+{
+  "threshold": 0.4,
+  "label_map": {
+    "Acne and Rosacea Photos": "Acne / Rosacea",
+    "Cellulitis Impetigo and other Bacterial Infections": "Bacterial infection (Impetigo/Cellulitis)",
+    "Eczema Photos": "Eczema",
+    "Light Diseases and Disorders of Pigmentation": "Pigmentation disorder (Vitiligo-like)",
+    "Melanoma Skin Cancer Nevi and Moles": "Melanoma / Mole",
+    "Psoriasis pictures Lichen Planus and related diseases": "Psoriasis / Lichen planus",
+    "Seborrheic Keratoses and other Benign Tumors": "Benign tumor (Seborrheic keratosis)",
+    "Tinea Ringworm Candidiasis and other Fungal Infections": "Fungal infection (Ringworm/Tinea)",
+    "Urticaria Hives": "Hives (Urticaria)",
+    "Warts Molluscum and other Viral Infections": "Viral infection (Warts/Molluscum)"
+  },
+  "img_size": [
+    224,
+    224
+  ],
+  "model": "MobileNetV3Large",
+  "classes": [
+    "Acne and Rosacea Photos",
+    "Cellulitis Impetigo and other Bacterial Infections",
+    "Eczema Photos",
+    "Light Diseases and Disorders of Pigmentation",
+    "Melanoma Skin Cancer Nevi and Moles",
+    "Psoriasis pictures Lichen Planus and related diseases",
+    "Seborrheic Keratoses and other Benign Tumors",
+    "Tinea Ringworm Candidiasis and other Fungal Infections",
+    "Urticaria Hives",
+    "Warts Molluscum and other Viral Infections"
+  ]
+}

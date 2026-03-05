@@ -47,3 +47,12 @@ Step 7: Run FastAPI Application
 uvicorn app.main:app --reload
 
 http://127.0.0.1:8000/docs
+
+## Disease Name Model (optional)
+
+To enable disease-name prediction in `/ml/analyze-image`, add these files under `model/`:
+- `edgecare_disease_model.tflite`
+- `edgecare_disease_labels.json`
+(Optional) `edgecare_disease_config.json` (threshold + label mapping)
+
+If these files are not present, the API will still return severity (mild/moderate/severe) and `disease` will be `null`.
