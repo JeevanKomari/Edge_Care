@@ -3,7 +3,8 @@ import json
 import numpy as np
 from PIL import Image
 import cv2
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
+tflite = tf.lite
 
 # ============================================================
 # 1) Existing Severity Model (mild/moderate/severe)
