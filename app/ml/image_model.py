@@ -4,32 +4,42 @@ import numpy as np
 from PIL import Image
 import cv2
 import tensorflow as tf
+
 tflite = tf.lite
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+MODEL_DIR = os.path.join(BASE_DIR, "model")
 
 # ============================================================
 # 1) Existing Severity Model (mild/moderate/severe)
 # ============================================================
-SEVERITY_MODEL_PATH = "model/skin_model.tflite"
+SEVERITY_MODEL_PATH = os.path.join(MODEL_DIR, "skin_model.tflite")
 SEVERITY_CLASS_NAMES = ["mild", "moderate", "severe"]
 
 severity_interpreter = None
 severity_input_details = None
 severity_output_details = None
 
-if os.path.exists(SEVERITY_MODEL_PATH):
-    severity_interpreter = tflite.Interpreter(model_path=SEVERITY_MODEL_PATH)
-    severity_interpreter.allocate_tensors()
-    severity_input_details = severity_interpreter.get_input_details()
-    severity_output_details = severity_interpreter.get_output_details()
-else:
-    print("⚠️ Severity model not found at:", SEVERITY_MODEL_PATH)
+try:
+    if os.path.exists(SEVERITY_MODEL_PATH):
+        severity_interpreter = tflite.Interpreter(model_path=SEVERITY_MODEL_PATH)
+        severity_interpreter.allocate_tensors()
+        severity_input_details = severity_interpreter.get_input_details()
+        severity_output_details = severity_interpreter.get_output_details()
+    else:
+        print("⚠️ Severity model not found at:", SEVERITY_MODEL_PATH)
+except Exception as e:
+    severity_interpreter = None
+    severity_input_details = None
+    severity_output_details = None
+    print(f"⚠️ Severity model load failed: {e}")
 
 # ============================================================
 # 2) New Disease Name Model (DermNet subset)
 # ============================================================
-DISEASE_MODEL_PATH = "model/edgecare_disease_model.tflite"
-DISEASE_LABELS_PATH = "model/edgecare_disease_labels.json"
-DISEASE_CONFIG_PATH = "model/edgecare_disease_config.json"
+DISEASE_MODEL_PATH = os.path.join(MODEL_DIR, "edgecare_disease_model.tflite")
+DISEASE_LABELS_PATH = os.path.join(MODEL_DIR, "edgecare_disease_labels.json")
+DISEASE_CONFIG_PATH = os.path.join(MODEL_DIR, "edgecare_disease_config.json")
 
 DISEASE_THRESHOLD_DEFAULT = 0.40  # 'No rash / unclear image' gate
 
@@ -56,12 +66,14 @@ DEFAULT_LABEL_MAP = {
 
 label_map = DEFAULT_LABEL_MAP.copy()
 
+
 def _safe_load_json(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
+
 
 def _init_disease_model():
     global disease_interpreter, disease_input_details, disease_output_details
@@ -71,10 +83,20 @@ def _init_disease_model():
         print("⚠️ Disease model not found at:", DISEASE_MODEL_PATH)
         return
 
-    disease_interpreter = tflite.Interpreter(model_path=DISEASE_MODEL_PATH)
-    disease_interpreter.allocate_tensors()
-    disease_input_details = disease_interpreter.get_input_details()
-    disease_output_details = disease_interpreter.get_output_details()
+    try:
+        disease_interpreter = tflite.Interpreter(model_path=DISEASE_MODEL_PATH)
+        disease_interpreter.allocate_tensors()
+        disease_input_details = disease_interpreter.get_input_details()
+        disease_output_details = disease_interpreter.get_output_details()
+    except Exception as e:
+        disease_interpreter = None
+        disease_input_details = None
+        disease_output_details = None
+        disease_class_names = None
+        disease_threshold = DISEASE_THRESHOLD_DEFAULT
+        label_map = DEFAULT_LABEL_MAP.copy()
+        print(f"⚠️ Disease model load failed: {e}")
+        return
 
     # labels
     labels = _safe_load_json(DISEASE_LABELS_PATH)
@@ -94,7 +116,9 @@ def _init_disease_model():
         if isinstance(lm, dict) and lm:
             label_map = {**label_map, **lm}
 
+
 _init_disease_model()
+
 
 # ============================================================
 # Common helpers
@@ -106,22 +130,24 @@ def preprocess_image_224(image: Image.Image) -> np.ndarray:
     arr = np.expand_dims(arr, axis=0)
     return arr.astype(np.float32)
 
+
 def is_image_blurry(image: Image.Image, threshold: float = 100.0) -> bool:
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
     return variance < threshold
+
 
 def _softmax_if_needed(x: np.ndarray) -> np.ndarray:
     """Some TFLite exports already output softmax; this keeps it safe."""
     x = np.asarray(x, dtype=np.float32)
     if x.ndim != 1:
         x = x.reshape(-1)
-    # if sums to ~1, assume it's already probabilities
     s = float(np.sum(x))
     if 0.98 <= s <= 1.02 and np.all(x >= 0.0) and np.all(x <= 1.0):
         return x
     e = np.exp(x - np.max(x))
     return e / np.sum(e)
+
 
 def _predict_severity(input_data: np.ndarray):
     if severity_interpreter is None:
@@ -146,13 +172,24 @@ def _predict_severity(input_data: np.ndarray):
         },
     }, None
 
+
 def _predict_disease(input_data: np.ndarray):
     if disease_interpreter is None:
-        return None  # disease model optional
+        return {
+            "status": "disabled",
+            "message": "Disease model not loaded on server.",
+        }
 
-    disease_interpreter.set_tensor(disease_input_details[0]["index"], input_data)
-    disease_interpreter.invoke()
-    raw = disease_interpreter.get_tensor(disease_output_details[0]["index"])[0]
+    try:
+        disease_interpreter.set_tensor(disease_input_details[0]["index"], input_data)
+        disease_interpreter.invoke()
+        raw = disease_interpreter.get_tensor(disease_output_details[0]["index"])[0]
+    except Exception as e:
+        return {
+            "status": "disabled",
+            "message": f"Disease model inference failed: {e}",
+        }
+
     probs = _softmax_if_needed(raw)
 
     idx = int(np.argmax(probs))
@@ -183,6 +220,7 @@ def _predict_disease(input_data: np.ndarray):
         "raw_label": raw_label,
     }
 
+
 # ============================================================
 # Public API called by /ml/analyze-image
 # ============================================================
@@ -202,5 +240,5 @@ def analyze_image(file):
 
     # Backward compatible response + new fields
     resp = dict(severity_result)
-    resp["disease"] = disease_result  # can be None if model not present
+    resp["disease"] = disease_result
     return resp
