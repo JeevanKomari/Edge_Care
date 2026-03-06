@@ -1,7 +1,21 @@
 {
-  "threshold": 0.28,
-  "top_k": 3,
-  "min_severity_conf_for_rash": 0.34,
+  "model": "MobileNetV3Large",
+  "img_size": [
+    224,
+    224
+  ],
+  "classes": [
+    "Acne and Rosacea Photos",
+    "Cellulitis Impetigo and other Bacterial Infections",
+    "Eczema Photos",
+    "Light Diseases and Disorders of Pigmentation",
+    "Melanoma Skin Cancer Nevi and Moles",
+    "Psoriasis pictures Lichen Planus and related diseases",
+    "Seborrheic Keratoses and other Benign Tumors",
+    "Tinea Ringworm Candidiasis and other Fungal Infections",
+    "Urticaria Hives",
+    "Warts Molluscum and other Viral Infections"
+  ],
   "label_map": {
     "Acne and Rosacea Photos": "Acne / Rosacea",
     "Cellulitis Impetigo and other Bacterial Infections": "Bacterial infection (Impetigo/Cellulitis)",
@@ -14,33 +28,8 @@
     "Urticaria Hives": "Hives (Urticaria)",
     "Warts Molluscum and other Viral Infections": "Viral infection (Warts/Molluscum)"
   },
-  "label_short_map": {
-    "Acne and Rosacea Photos": "Acne / Rosacea",
-    "Cellulitis Impetigo and other Bacterial Infections": "Bacterial Infection",
-    "Eczema Photos": "Eczema",
-    "Light Diseases and Disorders of Pigmentation": "Pigmentation Disorder",
-    "Melanoma Skin Cancer Nevi and Moles": "Melanoma / Nevi",
-    "Psoriasis pictures Lichen Planus and related diseases": "Psoriasis / Lichen Planus",
-    "Seborrheic Keratoses and other Benign Tumors": "Benign Tumor",
-    "Tinea Ringworm Candidiasis and other Fungal Infections": "Fungal Infection",
-    "Urticaria Hives": "Hives (Urticaria)",
-    "Warts Molluscum and other Viral Infections": "Viral Infection"
-  },
-  "img_size": [
-    224,
-    224
-  ],
-  "model": "MobileNetV3Large",
-  "classes": [
-    "Acne and Rosacea Photos",
-    "Cellulitis Impetigo and other Bacterial Infections",
-    "Eczema Photos",
-    "Light Diseases and Disorders of Pigmentation",
-    "Melanoma Skin Cancer Nevi and Moles",
-    "Psoriasis pictures Lichen Planus and related diseases",
-    "Seborrheic Keratoses and other Benign Tumors",
-    "Tinea Ringworm Candidiasis and other Fungal Infections",
-    "Urticaria Hives",
-    "Warts Molluscum and other Viral Infections"
-  ]
+  "threshold": 0.28,
+  "version": "mnv3_weighted_splitfix_gpu_v1",
+  "val_accuracy": 0.4963,
+  "test_accuracy": 0.49
 }
