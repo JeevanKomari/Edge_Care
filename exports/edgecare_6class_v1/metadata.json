@@ -1,0 +1,23 @@
+{
+  "model_name": "edgecare_6class_effnetb0_best",
+  "input_size": [
+    224,
+    224
+  ],
+  "class_names": [
+    "acne",
+    "eczema",
+    "fungal",
+    "pigmentation",
+    "psoriasis",
+    "urticaria"
+  ],
+  "test_accuracy": 0.5538972020149231,
+  "test_top2_accuracy": 0.7686567306518555,
+  "notes": {
+    "dataset": "DermNet remapped to 6 broad classes",
+    "classes": "acne, eczema, fungal, pigmentation, psoriasis, urticaria",
+    "training": "EfficientNetB0 transfer learning + gentle fine-tuning",
+    "warning": "Use for triage support only, not final diagnosis"
+  }
+}

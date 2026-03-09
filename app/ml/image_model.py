@@ -1,7 +1,7 @@
 import os
 import json
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import cv2
 import tensorflow as tf
 
@@ -9,9 +9,10 @@ tflite = tf.lite
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
+EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "edgecare_6class_v1")
 
 # ============================================================
-# 1) Existing Severity Model (mild/moderate/severe)
+# 1) Existing Severity Model (mild/moderate/severe) -- unchanged
 # ============================================================
 SEVERITY_MODEL_PATH = os.path.join(MODEL_DIR, "skin_model.tflite")
 SEVERITY_CLASS_NAMES = ["mild", "moderate", "severe"]
@@ -27,120 +28,60 @@ try:
         severity_input_details = severity_interpreter.get_input_details()
         severity_output_details = severity_interpreter.get_output_details()
     else:
-        print("⚠️ Severity model not found at:", SEVERITY_MODEL_PATH)
+        print("WARN: Severity model not found at:", SEVERITY_MODEL_PATH)
 except Exception as e:
     severity_interpreter = None
     severity_input_details = None
     severity_output_details = None
-    print(f"⚠️ Severity model load failed: {e}")
+    print(f"WARN: Severity model load failed: {e}")
 
 # ============================================================
-# 2) Disease Model (DermNet subset)
+# 2) New Disease Model (6-class Keras)
 # ============================================================
-DISEASE_MODEL_PATH = os.path.join(MODEL_DIR, "edgecare_disease_model.tflite")
-DISEASE_LABELS_PATH = os.path.join(MODEL_DIR, "edgecare_disease_labels.json")
-DISEASE_CONFIG_PATH = os.path.join(MODEL_DIR, "edgecare_disease_config.json")
+DISEASE_MODEL_KERAS_PATH = os.path.join(EXPORTS_DIR, "edgecare_6class_effnetb0_best.keras")
+DISEASE_CLASS_NAMES_PATH = os.path.join(EXPORTS_DIR, "class_names.json")
+DISEASE_TOP_K = 3
+UNCERTAIN_TOP1_THRESHOLD = 0.45
+UNCERTAIN_MARGIN_THRESHOLD = 0.08
 
-DISEASE_THRESHOLD_DEFAULT = 0.28
-DISEASE_TOP_K_DEFAULT = 3
-MIN_SEVERITY_CONF_DEFAULT = 0.34
-
-disease_interpreter = None
-disease_input_details = None
-disease_output_details = None
-
+disease_model = None
 disease_class_names = None
-disease_threshold = DISEASE_THRESHOLD_DEFAULT
-disease_top_k = DISEASE_TOP_K_DEFAULT
-min_severity_conf_for_rash = MIN_SEVERITY_CONF_DEFAULT
-
-# Folder-name labels -> clean user-facing names
-DEFAULT_LABEL_MAP = {
-    "Acne and Rosacea Photos": "Acne / Rosacea",
-    "Cellulitis Impetigo and other Bacterial Infections": "Bacterial infection (Impetigo/Cellulitis)",
-    "Eczema Photos": "Eczema",
-    "Light Diseases and Disorders of Pigmentation": "Pigmentation disorder (Vitiligo-like)",
-    "Melanoma Skin Cancer Nevi and Moles": "Melanoma / Mole",
-    "Psoriasis pictures Lichen Planus and related diseases": "Psoriasis / Lichen planus",
-    "Seborrheic Keratoses and other Benign Tumors": "Benign tumor (Seborrheic keratosis)",
-    "Tinea Ringworm Candidiasis and other Fungal Infections": "Fungal infection (Ringworm/Tinea)",
-    "Urticaria Hives": "Hives (Urticaria)",
-    "Warts Molluscum and other Viral Infections": "Viral infection (Warts/Molluscum)",
-}
-
-label_map = DEFAULT_LABEL_MAP.copy()
 
 
-def _safe_load_json(path):
+def _load_disease_class_names():
+    global disease_class_names
+    if disease_class_names is not None:
+        return True
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _init_disease_model():
-    global disease_interpreter, disease_input_details, disease_output_details
-    global disease_class_names, disease_threshold, disease_top_k, min_severity_conf_for_rash, label_map
-
-    if not os.path.exists(DISEASE_MODEL_PATH):
-        print("⚠️ Disease model not found at:", DISEASE_MODEL_PATH)
-        return
-
-    try:
-        disease_interpreter = tflite.Interpreter(model_path=DISEASE_MODEL_PATH)
-        disease_interpreter.allocate_tensors()
-        disease_input_details = disease_interpreter.get_input_details()
-        disease_output_details = disease_interpreter.get_output_details()
+        with open(DISEASE_CLASS_NAMES_PATH, "r", encoding="utf-8") as f:
+            disease_class_names = json.load(f)
+        return True
     except Exception as e:
-        disease_interpreter = None
-        disease_input_details = None
-        disease_output_details = None
+        print(f"WARN: Failed to load disease class names: {e}")
         disease_class_names = None
-        disease_threshold = DISEASE_THRESHOLD_DEFAULT
-        disease_top_k = DISEASE_TOP_K_DEFAULT
-        min_severity_conf_for_rash = MIN_SEVERITY_CONF_DEFAULT
-        label_map = DEFAULT_LABEL_MAP.copy()
-        print(f"⚠️ Disease model load failed: {e}")
-        return
-
-    # labels
-    labels = _safe_load_json(DISEASE_LABELS_PATH)
-    if isinstance(labels, list) and len(labels) > 0:
-        disease_class_names = labels
-    else:
-        disease_class_names = None
-        print("⚠️ Disease labels JSON not found/invalid at:", DISEASE_LABELS_PATH)
-
-    # optional config (threshold, top_k, label map)
-    cfg = _safe_load_json(DISEASE_CONFIG_PATH)
-    if isinstance(cfg, dict):
-        th = cfg.get("threshold")
-        if isinstance(th, (int, float)):
-            disease_threshold = float(th)
-
-        tk = cfg.get("top_k")
-        if isinstance(tk, int) and tk > 0:
-            disease_top_k = tk
-
-        ms = cfg.get("min_severity_conf_for_rash")
-        if isinstance(ms, (int, float)):
-            min_severity_conf_for_rash = float(ms)
-
-        short_map = cfg.get("label_short_map")
-        lm = cfg.get("label_map")
-        if isinstance(short_map, dict) and short_map:
-            label_map = {**label_map, **short_map}
-        elif isinstance(lm, dict) and lm:
-            label_map = {**label_map, **lm}
-
-        # fall back to config classes if labels missing
-        classes_cfg = cfg.get("classes")
-        if disease_class_names is None and isinstance(classes_cfg, list) and classes_cfg:
-            disease_class_names = classes_cfg
+        return False
 
 
-_init_disease_model()
+def _load_disease_model():
+    global disease_model
+    if disease_model is not None:
+        return True
+    try:
+        if not os.path.exists(DISEASE_MODEL_KERAS_PATH):
+            print("WARN: Disease model not found at:", DISEASE_MODEL_KERAS_PATH)
+            return False
+        disease_model = tf.keras.models.load_model(DISEASE_MODEL_KERAS_PATH)
+        return True
+    except Exception as e:
+        print(f"WARN: Disease model load failed: {e}")
+        disease_model = None
+        return False
+
+
+def _ensure_disease_artifacts():
+    model_ok = _load_disease_model()
+    classes_ok = _load_disease_class_names()
+    return model_ok and classes_ok
 
 
 # ============================================================
@@ -161,7 +102,7 @@ def is_image_blurry(image: Image.Image, threshold: float = 100.0) -> bool:
 
 
 def _softmax_if_needed(x: np.ndarray) -> np.ndarray:
-    """Some TFLite exports already output softmax; this keeps it safe."""
+    """Ensure probability distribution; safe for logits or probs."""
     x = np.asarray(x, dtype=np.float32)
     if x.ndim != 1:
         x = x.reshape(-1)
@@ -196,87 +137,78 @@ def _predict_severity(input_data: np.ndarray):
     }, None
 
 
-def _get_top_predictions(probabilities: np.ndarray, top_k: int):
-    probs = np.asarray(probabilities, dtype=np.float32).reshape(-1)
-    sorted_idx = np.argsort(probs)[::-1][:top_k]
-    preds = []
-    for idx in sorted_idx:
-        score = float(probs[idx])
-        raw_label = (
-            disease_class_names[idx]
-            if disease_class_names and 0 <= idx < len(disease_class_names)
-            else f"class_{idx}"
-        )
-        friendly = label_map.get(raw_label, raw_label)
-        preds.append({"label": raw_label, "name": friendly, "score": round(score, 4)})
-    return preds
-
-
-def _predict_disease(input_data: np.ndarray, severity_max_prob: float):
-    if disease_interpreter is None:
+def _predict_disease(input_data: np.ndarray):
+    if not _ensure_disease_artifacts():
         return {
             "status": "disabled",
-            "message": "Disease model not loaded on server.",
+            "message": (
+                "Disease model artifacts missing. "
+                "Ensure exports/edgecare_6class_v1 with .keras and class_names.json is present."
+            ),
         }
 
     try:
-        disease_interpreter.set_tensor(disease_input_details[0]["index"], input_data)
-        disease_interpreter.invoke()
-        raw = disease_interpreter.get_tensor(disease_output_details[0]["index"])[0]
+        raw = disease_model.predict(input_data, verbose=0)[0]
     except Exception as e:
-        return {
-            "status": "disabled",
-            "message": f"Disease model inference failed: {e}",
-        }
+        return {"status": "disabled", "message": f"Disease model inference failed: {e}"}
 
     probs = _softmax_if_needed(raw)
-    top_predictions = _get_top_predictions(probs, disease_top_k)
 
-    if not top_predictions:
+    if disease_class_names is None or len(disease_class_names) != len(probs):
         return {
             "status": "disabled",
-            "message": "Disease model returned no predictions.",
+            "message": "Disease class names missing or length mismatch with model output.",
         }
 
-    top1 = top_predictions[0]
-    top1_score = float(top1["score"])
-    best_guess = top1["name"]
-    raw_label = top1["label"]
+    sorted_idx = np.argsort(probs)[::-1]
+    top1_idx = int(sorted_idx[0])
+    top2_idx = int(sorted_idx[1]) if len(sorted_idx) > 1 else top1_idx
 
-    if top1_score >= disease_threshold:
-        return {
-            "status": "rash_detected",
-            "disease_name": best_guess,
-            "confidence": round(top1_score, 4),
-            "raw_label": raw_label,
-            "top_predictions": top_predictions,
-        }
+    top1_score = float(probs[top1_idx])
+    top2_score = float(probs[top2_idx])
 
-    if severity_max_prob >= min_severity_conf_for_rash:
-        return {
-            "status": "uncertain",
-            "message": "Rash likely detected but disease type is uncertain. Upload a closer, well-lit photo focused on the affected area.",
-            "best_guess": best_guess,
-            "confidence": round(top1_score, 4),
-            "threshold": round(disease_threshold, 4),
-            "top_predictions": top_predictions,
-        }
+    uncertain = (top1_score < UNCERTAIN_TOP1_THRESHOLD) or (
+        (top1_score - top2_score) < UNCERTAIN_MARGIN_THRESHOLD
+    )
 
-    return {
-        "status": "no_rash_detected",
-        "message": "No rash detected or image is unclear. Please upload a clear rash/skin issue photo.",
-        "best_guess": best_guess,
-        "confidence": round(top1_score, 4),
-        "threshold": round(disease_threshold, 4),
-        "top_predictions": top_predictions,
+    top_predictions = []
+    for idx in sorted_idx[:DISEASE_TOP_K]:
+        top_predictions.append(
+            {
+                "label": disease_class_names[idx],
+                "score": round(float(probs[idx]), 4),
+            }
+        )
+
+    all_probabilities = {
+        disease_class_names[i]: round(float(probs[i]), 4) for i in range(len(probs))
     }
+
+    result = {
+        "status": "uncertain" if uncertain else "classified",
+        "predicted_class": disease_class_names[top1_idx],
+        "confidence": round(top1_score, 4),
+        "uncertain": uncertain,
+        "top_predictions": top_predictions,
+        "all_probabilities": all_probabilities,
+    }
+
+    if uncertain:
+        result["message"] = "Possible skin issue detected, but category is uncertain."
+
+    return result
 
 
 # ============================================================
 # Public API called by /ml/analyze-image
 # ============================================================
 def analyze_image(file):
-    image = Image.open(file.file).convert("RGB")
+    try:
+        image = Image.open(file.file).convert("RGB")
+    except UnidentifiedImageError:
+        return {"error": "Uploaded file is not a valid image."}
+    except Exception as e:
+        return {"error": f"Failed to read image: {e}"}
 
     if is_image_blurry(image):
         return {"error": "Image quality too low. Please retake the photo."}
@@ -287,12 +219,9 @@ def analyze_image(file):
     if severity_err:
         return severity_err
 
-    severity_probs = severity_result.get("all_probabilities", {})
-    severity_max_prob = max(severity_probs.values()) if severity_probs else 0.0
+    disease_result = _predict_disease(input_data)
 
-    disease_result = _predict_disease(input_data, severity_max_prob)
-
-    # Backward compatible response + new fields
+    # Backward compatible response: keep severity at top-level, nest disease result
     resp = dict(severity_result)
     resp["disease"] = disease_result
     return resp
