@@ -36,15 +36,17 @@ except Exception as e:
     print(f"WARN: Severity model load failed: {e}")
 
 # ============================================================
-# 2) New Disease Model (6-class Keras)
+# 2) New Disease Model (6-class TFLite)
 # ============================================================
-DISEASE_MODEL_KERAS_PATH = os.path.join(EXPORTS_DIR, "edgecare_6class_effnetb0_best.keras")
+DISEASE_MODEL_TFLITE_PATH = os.path.join(EXPORTS_DIR, "edgecare_6class_effnetb0_best.tflite")
 DISEASE_CLASS_NAMES_PATH = os.path.join(EXPORTS_DIR, "class_names.json")
 DISEASE_TOP_K = 3
 UNCERTAIN_TOP1_THRESHOLD = 0.45
 UNCERTAIN_MARGIN_THRESHOLD = 0.08
 
-disease_model = None
+disease_interpreter = None
+disease_input_details = None
+disease_output_details = None
 disease_class_names = None
 
 
@@ -62,24 +64,29 @@ def _load_disease_class_names():
         return False
 
 
-def _load_disease_model():
-    global disease_model
-    if disease_model is not None:
+def _load_disease_tflite():
+    global disease_interpreter, disease_input_details, disease_output_details
+    if disease_interpreter is not None:
         return True
+    if not os.path.exists(DISEASE_MODEL_TFLITE_PATH):
+        print("WARN: Disease model not found at:", DISEASE_MODEL_TFLITE_PATH)
+        return False
     try:
-        if not os.path.exists(DISEASE_MODEL_KERAS_PATH):
-            print("WARN: Disease model not found at:", DISEASE_MODEL_KERAS_PATH)
-            return False
-        disease_model = tf.keras.models.load_model(DISEASE_MODEL_KERAS_PATH)
+        disease_interpreter = tflite.Interpreter(model_path=DISEASE_MODEL_TFLITE_PATH)
+        disease_interpreter.allocate_tensors()
+        disease_input_details = disease_interpreter.get_input_details()
+        disease_output_details = disease_interpreter.get_output_details()
         return True
     except Exception as e:
+        disease_interpreter = None
+        disease_input_details = None
+        disease_output_details = None
         print(f"WARN: Disease model load failed: {e}")
-        disease_model = None
         return False
 
 
 def _ensure_disease_artifacts():
-    model_ok = _load_disease_model()
+    model_ok = _load_disease_tflite()
     classes_ok = _load_disease_class_names()
     return model_ok and classes_ok
 
@@ -143,12 +150,30 @@ def _predict_disease(input_data: np.ndarray):
             "status": "disabled",
             "message": (
                 "Disease model artifacts missing. "
-                "Ensure exports/edgecare_6class_v1 with .keras and class_names.json is present."
+                "Ensure exports/edgecare_6class_v1 with .tflite and class_names.json is present."
             ),
         }
 
+    if disease_input_details is None or disease_output_details is None:
+        return {"status": "disabled", "message": "Disease model not initialized."}
+
     try:
-        raw = disease_model.predict(input_data, verbose=0)[0]
+        # Match interpreter expected dtype/shape
+        expected_dtype = disease_input_details[0]["dtype"]
+        data = input_data.astype(expected_dtype, copy=False)
+        expected_shape = disease_input_details[0]["shape"]
+        if list(expected_shape) != list(data.shape):
+            try:
+                data = data.reshape(expected_shape)
+            except Exception:
+                return {
+                    "status": "disabled",
+                    "message": f"Input shape mismatch. Expected {expected_shape}, got {data.shape}.",
+                }
+
+        disease_interpreter.set_tensor(disease_input_details[0]["index"], data)
+        disease_interpreter.invoke()
+        raw = disease_interpreter.get_tensor(disease_output_details[0]["index"])[0]
     except Exception as e:
         return {"status": "disabled", "message": f"Disease model inference failed: {e}"}
 
