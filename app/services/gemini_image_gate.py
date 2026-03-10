@@ -65,6 +65,10 @@ class GateMetrics:
             "gate_retry_total": 0,
             "slow_gate_count": 0,
             "severity_uncertain_count": 0,
+            "retake_required_count": 0,
+            "disease_uncertain_count": 0,
+            "priority_review_count": 0,
+            "urgent_attention_count": 0,
         }
         self._latencies: List[float] = []
         self._label_counts: Dict[str, int] = {}
@@ -99,6 +103,22 @@ class GateMetrics:
     def inc_severity_uncertain(self) -> None:
         with self._lock:
             self._counters["severity_uncertain_count"] = self._counters.get("severity_uncertain_count", 0) + 1
+
+    def inc_retake_required(self) -> None:
+        with self._lock:
+            self._counters["retake_required_count"] = self._counters.get("retake_required_count", 0) + 1
+
+    def inc_disease_uncertain(self) -> None:
+        with self._lock:
+            self._counters["disease_uncertain_count"] = self._counters.get("disease_uncertain_count", 0) + 1
+
+    def inc_priority_review(self) -> None:
+        with self._lock:
+            self._counters["priority_review_count"] = self._counters.get("priority_review_count", 0) + 1
+
+    def inc_urgent_attention(self) -> None:
+        with self._lock:
+            self._counters["urgent_attention_count"] = self._counters.get("urgent_attention_count", 0) + 1
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:

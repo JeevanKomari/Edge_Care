@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 import logging
+from typing import Dict, Any
 
 import cv2
 import numpy as np
@@ -10,6 +11,7 @@ from PIL import Image, UnidentifiedImageError
 import tensorflow as tf
 
 from app.services.gemini_image_gate import run_image_gate, metrics as gemini_metrics
+from app.ml.disease_taxonomy import normalize_condition, normalize_predictions
 
 tflite = tf.lite
 logger = logging.getLogger(__name__)
@@ -118,6 +120,52 @@ def is_image_blurry(image: Image.Image, threshold: float = 100.0) -> bool:
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
     return variance < threshold
+
+
+def assess_image_quality(image: Image.Image) -> Dict[str, Any]:
+    """Lightweight heuristic quality assessment."""
+    arr = np.array(image)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    mean = gray.mean()
+    std = gray.std()
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    center = gray[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+    center_var = center.var()
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = edges.mean() / 255.0
+
+    flags = []
+    if lap_var < 80:
+        flags.append("blurry")
+    if mean < 70:
+        flags.append("low_brightness")
+    if std < 25:
+        flags.append("low_contrast")
+    if edge_density < 0.02:
+        flags.append("too_far")
+    if center_var < (0.5 * std if std > 0 else 0):
+        flags.append("lesion_not_centered")
+    white_ratio = (arr > 245).mean()
+    if white_ratio > 0.4:
+        flags.append("screenshot_or_ui_elements")
+
+    penalty = 0.0
+    for f in flags:
+        penalty += 0.15
+    quality_score = max(0.0, 1.0 - min(penalty, 0.9))
+    if quality_score >= 0.7:
+        status = "good"
+    elif quality_score >= 0.5:
+        status = "borderline"
+    else:
+        status = "poor"
+    return {
+        "quality_status": status,
+        "quality_score": round(float(quality_score), 3),
+        "quality_flags": flags,
+        "retake_required": status == "poor",
+    }
 
 
 def _softmax_if_needed(x: np.ndarray) -> np.ndarray:
@@ -345,6 +393,12 @@ def analyze_image(file, file_bytes: bytes | None = None):
             "message": "Image quality too low. Please retake the photo.",
         }
 
+    quality_result = assess_image_quality(image)
+    if quality_result.get("retake_required"):
+        gemini_metrics.inc_retake_required()
+        logger.info("quality_poor", extra={"quality": quality_result})
+    gate_result["quality"] = quality_result
+
     # Severity retains original normalization (/255). Disease can toggle via env for mismatch debug.
     severity_input = preprocess_image_224(image, normalize=True)
     disease_input = preprocess_image_224(image, normalize=DISEASE_TFLITE_NORMALIZE)
@@ -361,10 +415,20 @@ def analyze_image(file, file_bytes: bytes | None = None):
     # Severity uncertainty rule
     sev_probs = severity_result.get("all_probabilities", {}) if isinstance(severity_result, dict) else {}
     max_conf = max(sev_probs.values()) if sev_probs else 0.0
-    severity_uncertain = max_conf < 0.40
+    sorted_sev = sorted(sev_probs.items(), key=lambda x: x[1], reverse=True)
+    top1 = sorted_sev[0][1] if sorted_sev else 0.0
+    top2 = sorted_sev[1][1] if len(sorted_sev) > 1 else 0.0
+    severity_uncertain = (max_conf < 0.40) or ((top1 - top2) < 0.08)
     severity_status = "uncertain" if severity_uncertain else severity_result.get("predicted_class")
+    if top1 >= 0.7:
+        sev_band = "high"
+    elif top1 >= 0.5:
+        sev_band = "medium"
+    else:
+        sev_band = "low"
     severity_result["severity_status"] = severity_status
     severity_result["severity_uncertain"] = severity_uncertain
+    severity_result["confidence_band"] = sev_band
     if severity_uncertain:
         severity_result["warning"] = "Severity confidence is low; classification uncertain."
         gemini_metrics.inc_severity_uncertain()
@@ -380,9 +444,83 @@ def analyze_image(file, file_bytes: bytes | None = None):
         )
 
     disease_result = _predict_disease(disease_input)
+    # Disease uncertainty / ambiguity
+    try:
+        top_preds = disease_result.get("top_predictions", [])
+        top1 = top_preds[0]["score"] if top_preds else 0.0
+        top2 = top_preds[1]["score"] if len(top_preds) > 1 else 0.0
+        disease_status = "classified"
+        ambiguous = False
+        if (top1 < 0.55) or ((top1 - top2) < 0.15):
+            disease_status = "uncertain"
+            ambiguous = (top1 - top2) < 0.15
+            gemini_metrics.inc_disease_uncertain()
+        if top1 >= 0.75:
+            disease_band = "high"
+        elif top1 >= 0.55:
+            disease_band = "medium"
+        else:
+            disease_band = "low"
+        disease_result["disease_status"] = disease_status
+        disease_result["ambiguous"] = ambiguous
+        disease_result["confidence_band"] = disease_band
+        disease_result["differential_diagnoses"] = top_preds[:3]
+        # Normalize labels to canonical taxonomy
+        disease_result["top_predictions"] = normalize_predictions(top_preds)
+        top1_label = top_preds[0]["label"] if top_preds else disease_result.get("predicted_class")
+        canonical, display = normalize_condition(top1_label)
+        if canonical:
+            disease_result["canonical_label"] = canonical
+        if display:
+            disease_result["display_name"] = display
+        disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
+    except Exception:
+        pass
 
     ml_payload = dict(severity_result)
     ml_payload["disease"] = disease_result
+
+    # Triage rules
+    triage = {
+        "triage_level": "self_care",
+        "red_flags": [],
+        "needs_clinician_review": False,
+    }
+    quality = gate_result.get("quality", {})
+    if quality.get("quality_status") == "poor":
+        triage.update({"triage_level": "routine_review", "needs_clinician_review": True})
+        triage["red_flags"].append("poor_image_quality")
+        gemini_metrics.inc_priority_review()
+    gate_top = gate_result.get("top_label")
+    if gate_top == "rash_like_skin":
+        triage["triage_level"] = "priority_review"
+        triage["needs_clinician_review"] = True
+        gemini_metrics.inc_priority_review()
+    severity_cls = severity_result.get("predicted_class")
+    if severity_cls == "severe" and not severity_result.get("severity_uncertain"):
+        triage["triage_level"] = "priority_review"
+        triage["needs_clinician_review"] = True
+        gemini_metrics.inc_priority_review()
+        if severity_result.get("confidence", 0) >= 0.8:
+            triage["triage_level"] = "urgent_attention"
+            triage["red_flags"].append("high_severity_confidence")
+            triage["needs_clinician_review"] = True
+            gemini_metrics.inc_urgent_attention()
+            logger.warning("triage_escalation", extra={"triage": triage})
+    ml_payload["triage"] = triage
+
+    # Patient guidance
+    guidance = {
+        "summary": "Preliminary AI screening only. This is not a confirmed diagnosis.",
+        "next_step": "Consider dermatologist review if symptoms persist.",
+        "retake_required": quality.get("retake_required", False),
+        "urgent_warning": triage["triage_level"] == "urgent_attention",
+    }
+    if quality.get("retake_required"):
+        guidance["next_step"] = "Please retake a clear, well-lit close-up image of the area."
+    if triage["triage_level"] in ("priority_review", "urgent_attention"):
+        guidance["next_step"] = "Seek clinician review promptly."
+    ml_payload["patient_guidance"] = guidance
 
     response = {
         "success": True,
