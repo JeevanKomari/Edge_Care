@@ -2,15 +2,17 @@ import io
 import json
 import os
 import uuid
+import logging
 
 import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 import tensorflow as tf
 
-from app.services.gemini_image_gate import run_image_gate
+from app.services.gemini_image_gate import run_image_gate, metrics as gemini_metrics
 
 tflite = tf.lite
+logger = logging.getLogger(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "edgecare_6class_v1")
@@ -292,6 +294,16 @@ def analyze_image(file, file_bytes: bytes | None = None):
         request_id=request_id,
     )
 
+    if gate_result.get("latency_ms", 0) > 8000:
+        gate_result["slow_gate"] = True
+        gate_result["performance_warning"] = "Gemini gate latency high"
+        logger.warning(
+            "gemini_gate_slow",
+            extra={"gate": {"latency_ms": gate_result.get("latency_ms"), "model_id": gate_result.get("model_id")}},
+        )
+    else:
+        gate_result["slow_gate"] = gate_result.get("slow_gate", False)
+
     gate_status = gate_result.get("status")
     if gate_status == "error":
         return {
@@ -345,6 +357,27 @@ def analyze_image(file, file_bytes: bytes | None = None):
             "ml_analysis": None,
             "message": severity_err.get("error", "Severity model unavailable"),
         }
+
+    # Severity uncertainty rule
+    sev_probs = severity_result.get("all_probabilities", {}) if isinstance(severity_result, dict) else {}
+    max_conf = max(sev_probs.values()) if sev_probs else 0.0
+    severity_uncertain = max_conf < 0.40
+    severity_status = "uncertain" if severity_uncertain else severity_result.get("predicted_class")
+    severity_result["severity_status"] = severity_status
+    severity_result["severity_uncertain"] = severity_uncertain
+    if severity_uncertain:
+        severity_result["warning"] = "Severity confidence is low; classification uncertain."
+        gemini_metrics.inc_severity_uncertain()
+        logger.info(
+            "severity_uncertain_triggered",
+            extra={
+                "severity": {
+                    "predicted_class": severity_result.get("predicted_class"),
+                    "max_conf": max_conf,
+                    "all_probabilities": sev_probs,
+                }
+            },
+        )
 
     disease_result = _predict_disease(disease_input)
 

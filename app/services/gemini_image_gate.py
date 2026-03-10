@@ -63,6 +63,8 @@ class GateMetrics:
             "gate_fail_open_total": 0,
             "gate_timeout_total": 0,
             "gate_retry_total": 0,
+            "slow_gate_count": 0,
+            "severity_uncertain_count": 0,
         }
         self._latencies: List[float] = []
         self._label_counts: Dict[str, int] = {}
@@ -89,6 +91,14 @@ class GateMetrics:
     def record_reason_code(self, code: str) -> None:
         with self._lock:
             self._reason_code_counts[code] = self._reason_code_counts.get(code, 0) + 1
+
+    def inc_slow_gate(self) -> None:
+        with self._lock:
+            self._counters["slow_gate_count"] = self._counters.get("slow_gate_count", 0) + 1
+
+    def inc_severity_uncertain(self) -> None:
+        with self._lock:
+            self._counters["severity_uncertain_count"] = self._counters.get("severity_uncertain_count", 0) + 1
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -211,6 +221,7 @@ def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_t
         "attempted_models": [cfg.model],
         "provider_unavailable_models": [],
         "thresholds": {},
+        "slow_gate": False,
     }
 
     if not cfg.enabled:
@@ -260,6 +271,10 @@ def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_t
                 latency_ms = (time.perf_counter() - attempt_start) * 1000
                 response["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
                 metrics.observe_latency(response["latency_ms"])
+                if response["latency_ms"] > 8000:
+                    response["slow_gate"] = True
+                    response["performance_warning"] = "Gemini gate latency high"
+                    metrics.inc_slow_gate()
 
                 status = resp.status_code
                 body_preview = resp.text[:1000] if cfg.debug else resp.text[:500]
@@ -352,6 +367,10 @@ def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_t
             metrics.inc("gate_fail_open_total")
         else:
             metrics.inc("gate_error_total")
+        if response.get("latency_ms", 0) > 8000:
+            response["slow_gate"] = True
+            response["performance_warning"] = "Gemini gate latency high"
+            metrics.inc_slow_gate()
         log_safe(logging.WARNING, "gemini_timeout_final", error=str(exc), latency_ms=response.get("latency_ms"))
     except requests.RequestException as exc:
         status = getattr(exc.response, "status_code", None)

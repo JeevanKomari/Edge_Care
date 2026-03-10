@@ -1,5 +1,6 @@
 ﻿import io
 import json
+import time
 
 import pytest
 import requests
@@ -144,6 +145,46 @@ def test_parse_failure(monkeypatch):
     assert res["latency_ms"] >= 0
 
 
+def test_slow_gate_flag(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+
+    class Resp:
+        status_code = 200
+        def json(self): return _fake_response("rash_like_skin", 0.9, "ok")
+        def raise_for_status(self): return None
+        text = json.dumps(_fake_response("rash_like_skin", 0.9, "ok"))
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Resp())
+    ticks = [0.0]
+    def fake_perf_counter():
+        ticks[0] += 9.1  # simulate 9.1 seconds total
+        return ticks[0]
+    monkeypatch.setattr(time, "perf_counter", fake_perf_counter)
+    res = run_image_gate(b"abc")
+    assert res.get("slow_gate") is True
+
+
+def test_normal_gate_not_slow(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+
+    class Resp:
+        status_code = 200
+        def json(self): return _fake_response("rash_like_skin", 0.9, "ok")
+        def raise_for_status(self): return None
+        text = json.dumps(_fake_response("rash_like_skin", 0.9, "ok"))
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Resp())
+    ticks = [0.0]
+    def fake_perf_counter():
+        ticks[0] += 1.5
+        return ticks[0]
+    monkeypatch.setattr(time, "perf_counter", fake_perf_counter)
+    res = run_image_gate(b"abc")
+    assert res.get("slow_gate") in (False, None)
+
+
 def test_gate_disabled(monkeypatch):
     reset_gate_metrics()
     monkeypatch.setenv("GEMINI_GATE_ENABLED", "false")
@@ -213,3 +254,85 @@ def test_endpoint_skips_ml_when_gate_rejects(monkeypatch):
     assert body["success"] is False
     assert body["image_gate"]["status"] == "rejected"
     assert body["ml_analysis"] is None
+
+
+def test_severity_uncertain_rule(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 2000,
+        "top_label": "rash_like_skin",
+        "top_score": 0.9,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "mild",
+                "confidence": 0.35,
+                "all_probabilities": {"mild": 0.35, "moderate": 0.33, "severe": 0.32},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {"status": "classified", "predicted_class": "eczema", "confidence": 0.8, "top_predictions": [], "all_probabilities": {}},
+    )
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ml_analysis"]["severity_uncertain"] is True
+    assert body["ml_analysis"]["severity_status"] == "uncertain"
+
+
+def test_slow_gate_flag_via_endpoint(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 9000,
+        "slow_gate": True,
+        "performance_warning": "Gemini gate latency high",
+        "top_label": "rash_like_skin",
+        "top_score": 0.9,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "mild",
+                "confidence": 0.9,
+                "all_probabilities": {"mild": 0.9, "moderate": 0.05, "severe": 0.05},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {"status": "classified", "predicted_class": "eczema", "confidence": 0.8, "top_predictions": [], "all_probabilities": {}},
+    )
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["image_gate"]["slow_gate"] is True
+    assert "performance_warning" in body["image_gate"]
