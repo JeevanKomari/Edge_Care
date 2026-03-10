@@ -1,12 +1,16 @@
-import os
+import io
 import json
+import os
+import uuid
+
+import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
-import cv2
 import tensorflow as tf
 
-tflite = tf.lite
+from app.services.hf_image_gate import load_gate_config, run_image_gate
 
+tflite = tf.lite
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "edgecare_6class_v1")
@@ -43,6 +47,10 @@ DISEASE_CLASS_NAMES_PATH = os.path.join(EXPORTS_DIR, "class_names.json")
 DISEASE_TOP_K = 3
 UNCERTAIN_TOP1_THRESHOLD = 0.45
 UNCERTAIN_MARGIN_THRESHOLD = 0.08
+
+# Toggle for disease preprocessing scale. True = /255 (current), False = raw 0-255
+DISEASE_TFLITE_NORMALIZE = os.getenv("DISEASE_TFLITE_NORMALIZE", "true").lower() in ("1", "true", "yes", "y")
+DISEASE_TFLITE_DEBUG = os.getenv("DISEASE_TFLITE_DEBUG", "false").lower() in ("1", "true", "yes", "y")
 
 disease_interpreter = None
 disease_input_details = None
@@ -94,10 +102,12 @@ def _ensure_disease_artifacts():
 # ============================================================
 # Common helpers
 # ============================================================
-def preprocess_image_224(image: Image.Image) -> np.ndarray:
-    """Resize to 224x224, normalize to [0,1], add batch dim."""
+def preprocess_image_224(image: Image.Image, normalize: bool = True) -> np.ndarray:
+    """Resize to 224x224, optional normalize to [0,1], add batch dim."""
     image = image.resize((224, 224))
-    arr = np.array(image) / 255.0
+    arr = np.array(image)
+    if normalize:
+        arr = arr / 255.0
     arr = np.expand_dims(arr, axis=0)
     return arr.astype(np.float32)
 
@@ -221,32 +231,139 @@ def _predict_disease(input_data: np.ndarray):
     if uncertain:
         result["message"] = "Possible skin issue detected, but category is uncertain."
 
+    if DISEASE_TFLITE_DEBUG:
+        print(
+            "[DISEASE_DEBUG] normalize=",
+            DISEASE_TFLITE_NORMALIZE,
+            "input_dtype=",
+            disease_input_details[0]["dtype"] if disease_input_details else None,
+            "input_shape=",
+            disease_input_details[0]["shape"] if disease_input_details else None,
+            "top_predictions=",
+            result.get("top_predictions"),
+        )
+
     return result
 
 
 # ============================================================
 # Public API called by /ml/analyze-image
 # ============================================================
-def analyze_image(file):
+def analyze_image(file, file_bytes: bytes | None = None):
+    """Run HF image gate first, then existing severity + disease pipeline."""
+    request_id = uuid.uuid4().hex
+    filename = getattr(file, "filename", None)
+    content_type = getattr(file, "content_type", None)
+
+    if file_bytes is None:
+        try:
+            file_bytes = file.file.read()
+        except Exception as e:
+            return {"success": False, "error": f"Failed to read upload: {e}"}
+
+    if not file_bytes:
+        return {"success": False, "error": "No image bytes received."}
+
+    if content_type and not content_type.startswith("image/"):
+        cfg = load_gate_config()
+        gate_result = {
+            "enabled": cfg.enabled,
+            "model_id": cfg.model_id,
+            "status": "error",
+            "accepted": False,
+            "reasons": ["Unsupported content type"],
+            "latency_ms": 0,
+            "top_label": None,
+            "top_score": None,
+            "scores": [],
+            "thresholds": {
+                "min_skin_score": cfg.thresholds.min_skin_score,
+                "max_non_skin_score": cfg.thresholds.max_non_skin_score,
+                "max_screenshot_score": cfg.thresholds.max_screenshot_score,
+                "max_blurry_score": cfg.thresholds.max_blurry_score,
+                "min_rash_or_normal_score": cfg.thresholds.min_rash_or_normal_score,
+            },
+        }
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": "Unsupported file type. Please upload an image.",
+        }
+
+    gate_result = run_image_gate(
+        file_bytes,
+        filename=filename,
+        content_type=content_type,
+        request_id=request_id,
+    )
+
+    gate_status = gate_result.get("status")
+    if gate_status == "error":
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": "Image gate unavailable. Please retry shortly.",
+        }
+    if gate_status == "rejected":
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": "Image rejected. Please upload a clear, close-up photo of the skin area.",
+        }
+
     try:
-        image = Image.open(file.file).convert("RGB")
+        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        return {"error": "Uploaded file is not a valid image."}
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": "Uploaded file is not a valid image.",
+        }
     except Exception as e:
-        return {"error": f"Failed to read image: {e}"}
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": f"Failed to read image: {e}",
+        }
 
     if is_image_blurry(image):
-        return {"error": "Image quality too low. Please retake the photo."}
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": "Image quality too low. Please retake the photo.",
+        }
 
-    input_data = preprocess_image_224(image)
+    # Severity retains original normalization (/255). Disease can toggle via env for mismatch debug.
+    severity_input = preprocess_image_224(image, normalize=True)
+    disease_input = preprocess_image_224(image, normalize=DISEASE_TFLITE_NORMALIZE)
 
-    severity_result, severity_err = _predict_severity(input_data)
+    severity_result, severity_err = _predict_severity(severity_input)
     if severity_err:
-        return severity_err
+        return {
+            "success": False,
+            "image_gate": gate_result,
+            "ml_analysis": None,
+            "message": severity_err.get("error", "Severity model unavailable"),
+        }
 
-    disease_result = _predict_disease(input_data)
+    disease_result = _predict_disease(disease_input)
 
-    # Backward compatible response: keep severity at top-level, nest disease result
-    resp = dict(severity_result)
-    resp["disease"] = disease_result
-    return resp
+    ml_payload = dict(severity_result)
+    ml_payload["disease"] = disease_result
+
+    response = {
+        "success": True,
+        "image_gate": gate_result,
+        "ml_analysis": ml_payload,
+        "message": "Analysis completed." if gate_status != "fail_open" else "Gate unavailable, ML analysis completed with fail-open.",
+    }
+
+    # Backward compatible: expose legacy keys alongside structured payload
+    response.update(ml_payload)
+    return response

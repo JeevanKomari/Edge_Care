@@ -13,7 +13,8 @@ router = APIRouter()
 
 @router.post("/analyze-image")
 async def analyze_image_api(file: UploadFile = File(...)):
-    return analyze_image(file)
+    file_bytes = await file.read()
+    return analyze_image(file, file_bytes)
 
 @router.post("/analyze-symptoms")
 def analyze_symptoms_api(data: SymptomInput):
@@ -29,8 +30,8 @@ def report_api(payload: ReportInput):
     return generate_report(payload.dict())
 
 @router.get("/model-metrics")
-def metrics_api():
-    return model_metrics()
+def metrics_api(dashboard_only: bool = False):
+    return model_metrics(dashboard_only=dashboard_only)
 
 @router.get("/health")
 def health_api():
