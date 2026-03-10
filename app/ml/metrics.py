@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, Dict
 
-from app.services.hf_image_gate import gate_metrics_snapshot
+from app.services.gemini_image_gate import gate_metrics_snapshot
 
 STATIC_METRICS_CACHE: Dict[str, Any] | None = None
 

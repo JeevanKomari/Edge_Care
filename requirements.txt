@@ -8,5 +8,4 @@ opencv-python-headless
 tensorflow-cpu==2.19.1
 scikit-learn==1.4.2
 requests
-huggingface_hub>=0.22.0
 pytest

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 import tensorflow as tf
 
-from app.services.hf_image_gate import load_gate_config, run_image_gate
+from app.services.gemini_image_gate import run_image_gate
 
 tflite = tf.lite
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -265,10 +265,9 @@ def analyze_image(file, file_bytes: bytes | None = None):
         return {"success": False, "error": "No image bytes received."}
 
     if content_type and not content_type.startswith("image/"):
-        cfg = load_gate_config()
         gate_result = {
-            "enabled": cfg.enabled,
-            "model_id": cfg.model_id,
+            "enabled": False,
+            "model_id": None,
             "status": "error",
             "accepted": False,
             "reasons": ["Unsupported content type"],
@@ -276,13 +275,8 @@ def analyze_image(file, file_bytes: bytes | None = None):
             "top_label": None,
             "top_score": None,
             "scores": [],
-            "thresholds": {
-                "min_skin_score": cfg.thresholds.min_skin_score,
-                "max_non_skin_score": cfg.thresholds.max_non_skin_score,
-                "max_screenshot_score": cfg.thresholds.max_screenshot_score,
-                "max_blurry_score": cfg.thresholds.max_blurry_score,
-                "min_rash_or_normal_score": cfg.thresholds.min_rash_or_normal_score,
-            },
+            "reason_codes": [],
+            "thresholds": {},
         }
         return {
             "success": False,
