@@ -40,6 +40,7 @@ SYNONYM_MAP: Dict[str, str] = {
     "ringworm": "Tinea Ringworm Candidiasis and other Fungal Infections",
     "candidiasis": "Tinea Ringworm Candidiasis and other Fungal Infections",
     "fungal infection": "Tinea Ringworm Candidiasis and other Fungal Infections",
+    "fungal": "Tinea Ringworm Candidiasis and other Fungal Infections",
     "urticaria": "Urticaria Hives",
     "hives": "Urticaria Hives",
     "wart": "Warts Molluscum and other Viral Infections",

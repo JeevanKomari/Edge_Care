@@ -537,3 +537,17 @@ def test_melanoma_nevi_normalization(monkeypatch):
         canon, display = disease_taxonomy.normalize_condition(term)
         assert canon == "Melanoma Skin Cancer Nevi and Moles"
         assert display == "Melanoma / Nevi"
+
+
+def test_fungal_normalization(monkeypatch):
+    from app.ml import disease_taxonomy
+    canon, display = disease_taxonomy.normalize_condition("fungal")
+    assert canon == "Tinea Ringworm Candidiasis and other Fungal Infections"
+    assert display == "Fungal Infection"
+
+
+def test_top_predictions_enriched(monkeypatch):
+    from app.ml.disease_taxonomy import normalize_predictions
+    preds = [{"label": "fungal", "score": 0.8}, {"label": "eczema", "score": 0.7}]
+    enriched = normalize_predictions(preds)
+    assert all("canonical_label" in p and "display_name" in p for p in enriched)

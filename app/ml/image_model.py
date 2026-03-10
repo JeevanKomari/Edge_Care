@@ -465,15 +465,24 @@ def analyze_image(file, file_bytes: bytes | None = None):
         disease_result["ambiguous"] = ambiguous
         disease_result["confidence_band"] = disease_band
         disease_result["differential_diagnoses"] = top_preds[:3]
-        # Normalize labels to canonical taxonomy
+        # Normalize labels to canonical taxonomy for all outputs
         disease_result["top_predictions"] = normalize_predictions(top_preds)
-        top1_label = top_preds[0]["label"] if top_preds else disease_result.get("predicted_class")
-        canonical, display = normalize_condition(top1_label)
-        if canonical:
-            disease_result["canonical_label"] = canonical
-        if display:
-            disease_result["display_name"] = display
         disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
+        pred_label = disease_result.get("predicted_class")
+        canonical_pc, display_pc = normalize_condition(pred_label)
+        if canonical_pc:
+            disease_result["canonical_label"] = canonical_pc
+        if display_pc:
+            disease_result["display_name"] = display_pc
+        top1_label = top_preds[0]["label"] if top_preds else pred_label
+        canonical, display = normalize_condition(top1_label)
+        # Prefer canonical/display for primary prediction if available
+        if canonical and not disease_result.get("canonical_label"):
+            disease_result["canonical_label"] = canonical
+        if display and not disease_result.get("display_name"):
+            disease_result["display_name"] = display
+        if display_pc:
+            disease_result["predicted_class_display"] = display_pc
     except Exception:
         pass
 
