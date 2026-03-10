@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -26,7 +26,11 @@ class GateConfig:
     api_key: Optional[str]
     model: str
     timeout: float
+    connect_timeout: float
+    read_timeout: float
+    max_retries: int
     fail_open: bool
+    debug: bool
 
 
 def _str_to_bool(val: Optional[str], default: bool = False) -> bool:
@@ -41,7 +45,11 @@ def load_gate_config() -> GateConfig:
         api_key=os.getenv("GEMINI_API_KEY"),
         model=os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
         timeout=float(os.getenv("GEMINI_GATE_TIMEOUT", 15)),
+        connect_timeout=float(os.getenv("GEMINI_GATE_CONNECT_TIMEOUT", 10)),
+        read_timeout=float(os.getenv("GEMINI_GATE_READ_TIMEOUT", 15)),
+        max_retries=int(os.getenv("GEMINI_GATE_MAX_RETRIES", 2)),
         fail_open=_str_to_bool(os.getenv("GEMINI_GATE_FAIL_OPEN"), True),
+        debug=_str_to_bool(os.getenv("GEMINI_GATE_DEBUG"), False),
     )
 
 
@@ -54,10 +62,12 @@ class GateMetrics:
             "gate_error_total": 0,
             "gate_fail_open_total": 0,
             "gate_timeout_total": 0,
+            "gate_retry_total": 0,
         }
         self._latencies: List[float] = []
         self._label_counts: Dict[str, int] = {}
         self._model_usage: Dict[str, int] = {}
+        self._reason_code_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def inc(self, key: str) -> None:
@@ -76,12 +86,17 @@ class GateMetrics:
         with self._lock:
             self._model_usage[model] = self._model_usage.get(model, 0) + 1
 
+    def record_reason_code(self, code: str) -> None:
+        with self._lock:
+            self._reason_code_counts[code] = self._reason_code_counts.get(code, 0) + 1
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             counters = dict(self._counters)
             lat = list(self._latencies)
             labels = dict(self._label_counts)
             models = dict(self._model_usage)
+            reason_codes = dict(self._reason_code_counts)
         if lat:
             lat_sorted = sorted(lat)
             p95_idx = max(int(len(lat_sorted) * 0.95) - 1, 0)
@@ -99,6 +114,7 @@ class GateMetrics:
             "gate_latency_ms": latency_stats,
             "label_counts": labels,
             "model_usage": models,
+            "reason_code_counts": reason_codes,
             **counters,
         }
 
@@ -109,6 +125,7 @@ class GateMetrics:
             self._latencies.clear()
             self._label_counts.clear()
             self._model_usage.clear()
+            self._reason_code_counts.clear()
 
 
 metrics = GateMetrics()
@@ -154,8 +171,31 @@ def _parse_response(text: str) -> Dict[str, Any]:
     return {"label": label, "confidence": conf, "reason": reason or ""}
 
 
+def _reason_code_for_http(status: int) -> str:
+    if status == 400:
+        return "GATE_HTTP_400"
+    if status == 401:
+        return "GATE_HTTP_401"
+    if status == 403:
+        return "GATE_HTTP_403"
+    if status == 404:
+        return "GATE_HTTP_404"
+    if status == 429:
+        return "GATE_HTTP_429"
+    if status == 500:
+        return "GATE_HTTP_500"
+    if status == 503:
+        return "GATE_HTTP_503"
+    if status == 502:
+        return "GATE_HTTP_502"
+    if status == 504:
+        return "GATE_HTTP_504"
+    return "GATE_HTTP_OTHER"
+
+
 def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_type: Optional[str] = None, request_id: Optional[str] = None) -> Dict[str, Any]:
     cfg = load_gate_config()
+    request_id = request_id or uuid.uuid4().hex
     metrics.inc("gate_requests_total")
     response: Dict[str, Any] = {
         "enabled": cfg.enabled,
@@ -176,66 +216,165 @@ def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_t
     if not cfg.enabled:
         return response
     if not cfg.api_key:
-        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": ["Gemini API key missing"], "reason_codes": ["GATE_EXCEPTION"]})
+        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": ["Gemini API key missing"], "reason_codes": ["GATE_PROVIDER_ERROR"]})
+        metrics.record_reason_code("GATE_PROVIDER_ERROR")
         metrics.inc("gate_fail_open_total" if cfg.fail_open else "gate_error_total")
         return response
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent"
     payload = _build_payload(image_bytes)
     headers = {"Content-Type": "application/json"}
+    params = {"key": cfg.api_key}
+    timeouts: Tuple[float, float] = (cfg.connect_timeout, cfg.read_timeout)
+
+    def log_safe(level, msg, **extra_fields):
+        safe = {
+            "request_id": request_id,
+            "provider": "gemini",
+            "model_id": cfg.model,
+            "endpoint": url,
+            "has_api_key": bool(cfg.api_key),
+            "connect_timeout": cfg.connect_timeout,
+            "read_timeout": cfg.read_timeout,
+            "image_size_bytes": len(image_bytes) if image_bytes is not None else None,
+            "content_type": content_type,
+            "prompt_mode": "json",
+            **extra_fields,
+        }
+        if cfg.debug:
+            logger.log(level, msg, extra={"gate": safe})
+        else:
+            filtered = {k: v for k, v in safe.items() if k not in {"body_preview"}}
+            logger.log(level, msg, extra={"gate": filtered})
 
     try:
-        start = time.perf_counter()
-        resp = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
-        latency_ms = (time.perf_counter() - start) * 1000
-        response["latency_ms"] = round(latency_ms, 2)
-        metrics.observe_latency(latency_ms)
-        if resp.status_code == 408:
-            raise requests.Timeout("Gemini timeout")
-        resp.raise_for_status()
-        result_json = resp.json()
-        text = None
-        if isinstance(result_json, dict):
-            candidates = result_json.get("candidates") or []
-            if candidates and "content" in candidates[0]:
-                parts = candidates[0]["content"].get("parts") or []
-                if parts and "text" in parts[0]:
-                    text = parts[0]["text"]
-        if not text:
-            raise ValueError("No text content returned")
-        parsed = _parse_response(text)
-        label = parsed["label"]
-        confidence = parsed["confidence"]
-        response.update({
-            "top_label": label,
-            "top_score": confidence,
-            "scores": [{"label": label, "score": confidence}],
-            "reasons": [parsed.get("reason", "")],
-            "reason_codes": [],
-            "model_id": cfg.model,
-        })
-        metrics.record_label(label)
-        metrics.record_model(cfg.model)
-        if label in {"rash_like_skin", "clear_or_normal_skin"}:
-            response["accepted"] = True
-            response["status"] = "accepted"
-            metrics.inc("gate_accept_total")
+        attempt = 0
+        start_total = time.perf_counter()
+        last_exc: Optional[Exception] = None
+        while attempt <= cfg.max_retries:
+            attempt += 1
+            attempt_start = time.perf_counter()
+            try:
+                log_safe(logging.INFO, "gemini_request_start", attempt=attempt)
+                resp = requests.post(url, headers=headers, params=params, json=payload, timeout=timeouts)
+                latency_ms = (time.perf_counter() - attempt_start) * 1000
+                response["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
+                metrics.observe_latency(response["latency_ms"])
+
+                status = resp.status_code
+                body_preview = resp.text[:1000] if cfg.debug else resp.text[:500]
+                log_safe(
+                    logging.INFO,
+                    "gemini_response",
+                    attempt=attempt,
+                    status_code=status,
+                    latency_ms=response["latency_ms"],
+                    body_preview=body_preview,
+                )
+
+                if status in {502, 503, 504} and attempt <= cfg.max_retries:
+                    metrics.inc("gate_retry_total")
+                    time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+                    last_exc = requests.HTTPError(f"HTTP {status}")
+                    continue
+
+                resp.raise_for_status()
+                result_json = resp.json()
+                text = None
+                if isinstance(result_json, dict):
+                    candidates = result_json.get("candidates") or []
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts") or []
+                        if parts and "text" in parts[0]:
+                            text = parts[0]["text"]
+                if not text:
+                    metrics.record_reason_code("GATE_EMPTY_RESPONSE")
+                    raise ValueError("No text content returned")
+                parsed = _parse_response(text)
+                label = parsed["label"]
+                confidence = parsed["confidence"]
+                response.update({
+                    "top_label": label,
+                    "top_score": confidence,
+                    "scores": [{"label": label, "score": confidence}],
+                    "reasons": [parsed.get("reason", "")],
+                    "reason_codes": [],
+                    "model_id": cfg.model,
+                })
+                metrics.record_label(label)
+                metrics.record_model(cfg.model)
+                log_safe(logging.INFO, "gemini_parse_success", attempt=attempt, label=label, confidence=confidence)
+                if label in {"rash_like_skin", "clear_or_normal_skin"}:
+                    response["accepted"] = True
+                    response["status"] = "accepted"
+                    metrics.inc("gate_accept_total")
+                else:
+                    response["accepted"] = False
+                    response["status"] = "rejected"
+                    metrics.inc("gate_reject_total")
+                break
+            except requests.Timeout as exc:
+                last_exc = exc
+                metrics.inc("gate_timeout_total")
+                metrics.record_reason_code("GATE_TIMEOUT")
+                response["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
+                log_safe(logging.WARNING, "gemini_timeout", attempt=attempt, latency_ms=response["latency_ms"], error=str(exc))
+                if attempt > cfg.max_retries:
+                    raise
+                metrics.inc("gate_retry_total")
+                time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+                continue
+            except requests.RequestException as exc:
+                last_exc = exc
+                response["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
+                rc = _reason_code_for_http(getattr(exc.response, "status_code", None) or 0) if hasattr(exc, "response") else "GATE_NETWORK_ERROR"
+                metrics.record_reason_code(rc)
+                log_safe(logging.WARNING, "gemini_http_error", attempt=attempt, status_code=getattr(exc.response, "status_code", None), latency_ms=response["latency_ms"], error=str(exc))
+                if getattr(exc.response, "status_code", 0) in {502, 503, 504} and attempt <= cfg.max_retries:
+                    metrics.inc("gate_retry_total")
+                    time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+                    continue
+                raise
+            except ValueError as exc:
+                last_exc = exc
+                response["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
+                metrics.record_reason_code("GATE_JSON_PARSE_ERROR")
+                log_safe(logging.WARNING, "gemini_parse_error", attempt=attempt, latency_ms=response["latency_ms"], error=str(exc))
+                raise
+
         else:
-            response["accepted"] = False
-            response["status"] = "rejected"
-            metrics.inc("gate_reject_total")
-    except requests.Timeout:
+            if last_exc:
+                raise last_exc
+
+    except requests.Timeout as exc:
         response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": ["Gemini gate timeout"], "reason_codes": ["GATE_TIMEOUT"]})
-        metrics.inc("gate_timeout_total")
         if cfg.fail_open:
             metrics.inc("gate_fail_open_total")
-        if not cfg.fail_open:
+        else:
             metrics.inc("gate_error_total")
+        log_safe(logging.WARNING, "gemini_timeout_final", error=str(exc), latency_ms=response.get("latency_ms"))
+    except requests.RequestException as exc:
+        status = getattr(exc.response, "status_code", None)
+        rc = _reason_code_for_http(status or 0) if status is not None else "GATE_NETWORK_ERROR"
+        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": [f"Gemini gate HTTP error: {status or exc}"], "reason_codes": [rc]})
+        if cfg.fail_open:
+            metrics.inc("gate_fail_open_total")
+        else:
+            metrics.inc("gate_error_total")
+        log_safe(logging.WARNING, "gemini_http_error_final", status_code=status, error=str(exc), latency_ms=response.get("latency_ms"))
+    except ValueError as exc:
+        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": [f"Gemini response invalid: {exc}"], "reason_codes": ["GATE_JSON_PARSE_ERROR"]})
+        if cfg.fail_open:
+            metrics.inc("gate_fail_open_total")
+        else:
+            metrics.inc("gate_error_total")
+        log_safe(logging.WARNING, "gemini_parse_error_final", error=str(exc), latency_ms=response.get("latency_ms"))
     except Exception as exc:
-        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": [f"Gemini gate failed: {exc}"], "reason_codes": ["GATE_EXCEPTION"]})
+        response.update({"accepted": cfg.fail_open, "status": "fail_open" if cfg.fail_open else "error", "reasons": [f"Gemini gate failed: {exc}"], "reason_codes": ["GATE_PROVIDER_ERROR"]})
         metrics.inc("gate_error_total")
         if cfg.fail_open:
             metrics.inc("gate_fail_open_total")
+        log_safe(logging.ERROR, "gemini_exception", error=str(exc), latency_ms=response.get("latency_ms"))
         logger.exception("Gemini image gate failure", extra={"request_id": request_id})
 
     return response

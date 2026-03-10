@@ -97,6 +97,51 @@ def test_fail_open_on_timeout(monkeypatch):
     assert res["status"] == "fail_open"
     assert res["accepted"] is True
     assert "GATE_TIMEOUT" in res.get("reason_codes", [])
+    assert res["latency_ms"] >= 0
+
+
+def test_retry_on_503_then_success(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    calls = {"n": 0}
+
+    class Resp503:
+        status_code = 503
+        text = "unavailable"
+        def json(self): return {"error": "svc"}
+        def raise_for_status(self): raise requests.HTTPError(response=self)
+    class Resp200:
+        status_code = 200
+        def json(self): return _fake_response("rash_like_skin", 0.9, "ok")
+        def raise_for_status(self): return None
+        text = json.dumps(_fake_response("rash_like_skin", 0.9, "ok"))
+
+    def post(*a, **k):
+        calls["n"] += 1
+        return Resp503() if calls["n"] == 1 else Resp200()
+
+    monkeypatch.setattr(requests, "post", post)
+    res = run_image_gate(b"abc")
+    assert res["status"] == "accepted"
+    assert res["attempted_models"] == [res["model_id"]]
+    snap = gemini_image_gate.metrics.snapshot()
+    assert snap["counters"]["gate_retry_total"] >= 1
+
+
+def test_parse_failure(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    class Resp:
+        status_code = 200
+        text = "badjson"
+        def json(self): return {"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}
+        def raise_for_status(self): return None
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Resp())
+    res = run_image_gate(b"abc")
+    assert res["status"] in ("fail_open", "error")
+    assert "GATE_JSON_PARSE_ERROR" in res.get("reason_codes", [])
+    assert res["latency_ms"] >= 0
 
 
 def test_gate_disabled(monkeypatch):
