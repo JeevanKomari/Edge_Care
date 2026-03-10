@@ -99,6 +99,33 @@ def test_fail_open_on_timeout(monkeypatch):
     assert "TIMEOUT" in result["reason_codes"]
 
 
+def test_zero_shot_called_without_timeout_kw(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+
+    class StubClient:
+        def __init__(self):
+            self.called_kwargs = None
+
+        def zero_shot_image_classification(self, image, candidate_labels=None, model=None, labels=None):
+            self.called_kwargs = {
+                "candidate_labels": candidate_labels,
+                "labels": labels,
+                "model": model,
+            }
+            return [
+                {"label": candidate_labels[0], "score": 0.7},
+                {"label": "a non-skin object", "score": 0.1},
+            ]
+
+    stub = StubClient()
+    monkeypatch.setattr(hf_image_gate, "_get_client", lambda cfg: stub)
+    result = run_image_gate(b"abc", filename="photo.png", content_type="image/png", request_id="req-stub", record_metrics=False)
+    assert stub.called_kwargs is not None
+    assert "timeout" not in stub.called_kwargs
+    assert stub.called_kwargs["model"] == hf_image_gate.load_gate_config().model_id
+    assert result["status"] in ("accepted", "rejected")
+
+
 def test_gate_disabled(monkeypatch):
     monkeypatch.setenv("HF_GATE_ENABLED", "false")
     result = run_image_gate(b"abc")

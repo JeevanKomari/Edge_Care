@@ -279,9 +279,9 @@ def load_gate_config() -> GateConfig:
 
 
 def _get_client(cfg: GateConfig) -> InferenceClient:
-    key = (cfg.model_id, bool(cfg.token))
+    key = (cfg.model_id, bool(cfg.token), cfg.timeout)
     if key not in _client_cache:
-        _client_cache[key] = InferenceClient(model=cfg.model_id, token=cfg.token)
+        _client_cache[key] = InferenceClient(token=cfg.token, timeout=cfg.timeout)
     return _client_cache[key]
 
 
@@ -420,11 +420,19 @@ def run_image_gate(
     try:
         client = _get_client(cfg)
         start = time.perf_counter()
-        raw_scores = client.zero_shot_image_classification(
-            image=image_bytes,
-            candidate_labels=CANDIDATE_LABELS,
-            timeout=cfg.timeout,
-        )
+        try:
+            raw_scores = client.zero_shot_image_classification(
+                image=image_bytes,
+                candidate_labels=CANDIDATE_LABELS,
+                model=cfg.model_id,
+            )
+        except TypeError:
+            # Older huggingface_hub versions use `labels` instead of `candidate_labels`
+            raw_scores = client.zero_shot_image_classification(
+                image=image_bytes,
+                labels=CANDIDATE_LABELS,
+                model=cfg.model_id,
+            )
         latency_ms = (time.perf_counter() - start) * 1000
         response["latency_ms"] = round(latency_ms, 2)
 
