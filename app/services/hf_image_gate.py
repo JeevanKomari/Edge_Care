@@ -42,6 +42,8 @@ class GateConfig:
     enabled: bool
     token: Optional[str]
     model_id: str
+    fallback_model_id: str
+    second_fallback_model_id: str
     timeout: float
     fail_open: bool
     thresholds: GateThresholds
@@ -77,6 +79,10 @@ class GateMetrics:
         self._reason_counts: Dict[str, int] = {}
         self._top_label_counts: Dict[str, int] = {}
         self._content_type_counts: Dict[str, int] = {}
+        self._provider_unavailable_total: int = 0
+        self._fallback_attempt_total: int = 0
+        self._fallback_success_total: int = 0
+        self._model_usage: Dict[str, int] = {}
         self._size_buckets: Dict[str, int] = {
             "lt_100kb": 0,
             "100kb_500kb": 0,
@@ -104,6 +110,10 @@ class GateMetrics:
             self._reason_counts.clear()
             self._top_label_counts.clear()
             self._content_type_counts.clear()
+            self._provider_unavailable_total = 0
+            self._fallback_attempt_total = 0
+            self._fallback_success_total = 0
+            self._model_usage.clear()
             for k in self._size_buckets:
                 self._size_buckets[k] = 0
             for k in self._latency_buckets:
@@ -134,6 +144,10 @@ class GateMetrics:
             latency_buckets = dict(self._latency_buckets)
             recent = list(self._recent)
             last_thresholds = dict(self._last_thresholds) if self._last_thresholds else None
+            provider_unavailable_total = self._provider_unavailable_total
+            fallback_attempt_total = self._fallback_attempt_total
+            fallback_success_total = self._fallback_success_total
+            model_usage = dict(self._model_usage)
         if latencies:
             sorted_latencies = sorted(latencies)
             p95_index = max(int(len(sorted_latencies) * 0.95) - 1, 0)
@@ -163,6 +177,10 @@ class GateMetrics:
             "gate_latency_ms": latency_stats,
             "recent_decisions": recent,
             "threshold_snapshot": last_thresholds,
+            "provider_unavailable_total": provider_unavailable_total,
+            "fallback_attempt_total": fallback_attempt_total,
+            "fallback_success_total": fallback_success_total,
+            "model_usage": model_usage,
             **counters_copy,
         }
 
@@ -235,9 +253,26 @@ class GateMetrics:
             # last thresholds snapshot
             self._last_thresholds = thresholds
 
+    def record_model_event(
+        self,
+        model_id: str,
+        provider_unavailable: bool = False,
+        fallback_used: bool = False,
+        success: bool = False,
+    ) -> None:
+        with self._lock:
+            if provider_unavailable:
+                self._provider_unavailable_total += 1
+            if fallback_used:
+                self._fallback_attempt_total += 1
+            if fallback_used and success:
+                self._fallback_success_total += 1
+            if success:
+                self._model_usage[model_id] = self._model_usage.get(model_id, 0) + 1
+
 
 gate_metrics = GateMetrics()
-_client_cache: Dict[Tuple[str, bool], InferenceClient] = {}
+_client_cache: Dict[Tuple[str, bool, float], InferenceClient] = {}
 
 
 def _str_to_bool(value: Optional[str], default: bool = False) -> bool:
@@ -254,6 +289,15 @@ def _get_env_float(name: str, default: float) -> float:
 
 
 def load_gate_config() -> GateConfig:
+    default_primary = os.getenv(
+        "HF_MODEL_ID", "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    )
+    default_fallback = os.getenv(
+        "HF_GATE_FALLBACK_MODEL_ID", "google/siglip2-base-patch16-224"
+    )
+    default_second_fallback = os.getenv(
+        "HF_GATE_SECOND_FALLBACK_MODEL_ID", "openai/clip-vit-large-patch14-336"
+    )
     thresholds = GateThresholds(
         min_skin_score=_get_env_float("HF_GATE_MIN_SKIN_SCORE", GateThresholds.min_skin_score),
         max_non_skin_score=_get_env_float("HF_GATE_MAX_NON_SKIN_SCORE", GateThresholds.max_non_skin_score),
@@ -262,7 +306,9 @@ def load_gate_config() -> GateConfig:
         min_rash_or_normal_score=_get_env_float("HF_GATE_MIN_RASH_OR_NORMAL_SCORE", GateThresholds.min_rash_or_normal_score),
     )
 
-    model_id = os.getenv("HF_MODEL_ID") or "openai/clip-vit-large-patch14-336"
+    model_id = default_primary
+    fallback_model_id = default_fallback
+    second_fallback_model_id = default_second_fallback
     enabled = _str_to_bool(os.getenv("HF_GATE_ENABLED"), True)
     token = os.getenv("HF_TOKEN")
     timeout = _get_env_float("HF_GATE_TIMEOUT", 8.0)
@@ -272,6 +318,8 @@ def load_gate_config() -> GateConfig:
         enabled=enabled,
         token=token,
         model_id=model_id,
+        fallback_model_id=fallback_model_id,
+        second_fallback_model_id=second_fallback_model_id,
         timeout=timeout,
         fail_open=fail_open,
         thresholds=thresholds,
@@ -283,6 +331,21 @@ def _get_client(cfg: GateConfig) -> InferenceClient:
     if key not in _client_cache:
         _client_cache[key] = InferenceClient(token=cfg.token, timeout=cfg.timeout)
     return _client_cache[key]
+
+
+def _model_chain(cfg: GateConfig) -> List[str]:
+    ordered = [
+        cfg.model_id,
+        cfg.fallback_model_id,
+        cfg.second_fallback_model_id,
+    ]
+    seen = set()
+    deduped = []
+    for mid in ordered:
+        if mid and mid not in seen:
+            deduped.append(mid)
+            seen.add(mid)
+    return deduped
 
 
 def normalize_scores(raw_scores: Any) -> List[Dict[str, Any]]:
@@ -371,6 +434,8 @@ def run_image_gate(
         "scores": [],
         "reasons": [],
         "reason_codes": [],
+        "attempted_models": [],
+        "provider_unavailable_models": [],
         "thresholds": {
             "min_skin_score": cfg.thresholds.min_skin_score,
             "max_non_skin_score": cfg.thresholds.max_non_skin_score,
@@ -419,47 +484,127 @@ def run_image_gate(
 
     try:
         client = _get_client(cfg)
-        start = time.perf_counter()
-        try:
-            raw_scores = client.zero_shot_image_classification(
-                image=image_bytes,
-                candidate_labels=CANDIDATE_LABELS,
-                model=cfg.model_id,
-            )
-        except TypeError:
-            # Older huggingface_hub versions use `labels` instead of `candidate_labels`
-            raw_scores = client.zero_shot_image_classification(
-                image=image_bytes,
-                labels=CANDIDATE_LABELS,
-                model=cfg.model_id,
-            )
-        latency_ms = (time.perf_counter() - start) * 1000
-        response["latency_ms"] = round(latency_ms, 2)
+        model_chain = _model_chain(cfg)
+        total_latency = 0.0
+        selected_model = None
+        attempted_models: List[str] = []
+        provider_unavailable_models: List[str] = []
 
-        decision = evaluate_gate_scores(raw_scores, cfg.thresholds)
-        if not decision.normalized_scores:
-            raise ValueError("HF gate returned empty scores")
-        response.update({
-            "accepted": decision.accepted,
-            "status": "accepted" if decision.accepted else "rejected",
-            "scores": decision.normalized_scores,
-            "top_label": decision.top_label,
-            "top_score": decision.top_score,
-            "reasons": decision.reasons,
-            "reason_codes": decision.reason_codes,
-        })
+        for idx, model_id in enumerate(model_chain):
+            attempted_models.append(model_id)
+            fallback_used = idx > 0
+            start = time.perf_counter()
+            try:
+                try:
+                    raw_scores = client.zero_shot_image_classification(
+                        image=image_bytes,
+                        candidate_labels=CANDIDATE_LABELS,
+                        model=model_id,
+                    )
+                except TypeError:
+                    raw_scores = client.zero_shot_image_classification(
+                        image=image_bytes,
+                        labels=CANDIDATE_LABELS,
+                        model=model_id,
+                    )
+                latency_ms = (time.perf_counter() - start) * 1000
+                total_latency += latency_ms
 
-        if decision.accepted:
-            gate_metrics.inc("gate_accept_total")
-        else:
-            gate_metrics.inc("gate_reject_total")
+                decision = evaluate_gate_scores(raw_scores, cfg.thresholds)
+                if not decision.normalized_scores:
+                    raise ValueError("HF gate returned empty scores")
+                response.update({
+                    "accepted": decision.accepted,
+                    "status": "accepted" if decision.accepted else "rejected",
+                    "scores": decision.normalized_scores,
+                    "top_label": decision.top_label,
+                    "top_score": decision.top_score,
+                    "reasons": decision.reasons,
+                    "reason_codes": decision.reason_codes,
+                    "model_id": model_id,
+                })
+                selected_model = model_id
+                response["latency_ms"] = round(total_latency, 2)
+                if decision.accepted:
+                    gate_metrics.inc("gate_accept_total")
+                else:
+                    gate_metrics.inc("gate_reject_total")
+                gate_metrics.record_model_event(
+                    model_id=model_id,
+                    provider_unavailable=False,
+                    fallback_used=fallback_used,
+                    success=True,
+                )
+                break
+            except StopIteration:
+                provider_unavailable_models.append(model_id)
+                gate_metrics.record_model_event(
+                    model_id=model_id,
+                    provider_unavailable=True,
+                    fallback_used=fallback_used,
+                    success=False,
+                )
+                continue
+            except InferenceTimeoutError:
+                total_latency += (time.perf_counter() - start) * 1000
+                response.update({
+                    "accepted": cfg.fail_open,
+                    "status": "fail_open" if cfg.fail_open else "error",
+                    "reasons": ["HF gate timeout"],
+                    "reason_codes": ["GATE_TIMEOUT"],
+                    "latency_ms": round(total_latency, 2),
+                    "model_id": model_id,
+                })
+                gate_metrics.inc("gate_timeout_total")
+                _record_error_metrics(response["status"])
+                logger.warning("HF image gate timeout", extra={"request_id": request_id})
+                break
+            except HTTPError as exc:
+                total_latency += (time.perf_counter() - start) * 1000
+                response.update({
+                    "accepted": cfg.fail_open,
+                    "status": "fail_open" if cfg.fail_open else "error",
+                    "reasons": [f"HF HTTP error: {exc.response.status_code if hasattr(exc, 'response') else exc}"],
+                    "reason_codes": ["GATE_HTTP_ERROR"],
+                    "latency_ms": round(total_latency, 2),
+                    "model_id": model_id,
+                })
+                _record_error_metrics(response["status"])
+                logger.warning("HF image gate HTTP error", extra={"request_id": request_id})
+                break
+            except Exception as exc:
+                total_latency += (time.perf_counter() - start) * 1000
+                reason = str(exc) or exc.__class__.__name__
+                response.update({
+                    "accepted": cfg.fail_open,
+                    "status": "fail_open" if cfg.fail_open else "error",
+                    "reasons": [f"HF gate failed: {reason}"],
+                    "reason_codes": ["GATE_EXCEPTION"],
+                    "latency_ms": round(total_latency, 2),
+                    "model_id": model_id,
+                })
+                _record_error_metrics(response["status"])
+                logger.exception("HF image gate failure", extra={"request_id": request_id})
+                break
+
+        response["attempted_models"] = attempted_models
+        response["provider_unavailable_models"] = provider_unavailable_models
+        if selected_model is None:
+            response["model_id"] = cfg.model_id
+            if provider_unavailable_models and len(provider_unavailable_models) == len(attempted_models):
+                response.update({
+                    "accepted": cfg.fail_open,
+                    "status": "fail_open" if cfg.fail_open else "error",
+                    "reason_codes": list(set(response.get("reason_codes", []) + ["PROVIDER_UNAVAILABLE"])),
+                    "reasons": ["No HF provider available for configured models"],
+                })
 
     except InferenceTimeoutError as exc:  # timeout path
         response.update({
             "accepted": cfg.fail_open,
             "status": "fail_open" if cfg.fail_open else "error",
             "reasons": ["HF gate timeout"],
-            "reason_codes": ["TIMEOUT"],
+            "reason_codes": ["GATE_TIMEOUT"],
         })
         gate_metrics.inc("gate_timeout_total")
         _record_error_metrics(response["status"])
@@ -469,7 +614,7 @@ def run_image_gate(
             "accepted": cfg.fail_open,
             "status": "fail_open" if cfg.fail_open else "error",
             "reasons": [f"HF HTTP error: {exc.response.status_code if hasattr(exc, 'response') else exc}"],
-            "reason_codes": ["HTTP_ERROR"],
+            "reason_codes": ["GATE_HTTP_ERROR"],
         })
         _record_error_metrics(response["status"])
         logger.warning("HF image gate HTTP error", extra={"request_id": request_id})
@@ -512,6 +657,7 @@ def _log_gate_event(
     size_bytes: Optional[int],
     request_id: Optional[str],
 ) -> None:
+    attempted = gate_response.get("attempted_models") or []
     payload = {
         "request_id": request_id or uuid.uuid4().hex,
         "filename": filename,
@@ -525,6 +671,12 @@ def _log_gate_event(
         "thresholds": gate_response.get("thresholds"),
         "reasons": gate_response.get("reasons"),
         "reason_codes": gate_response.get("reason_codes"),
+        "task": "zero-shot-image-classification",
+        "attempted_models": attempted,
+        "provider_unavailable_models": gate_response.get("provider_unavailable_models"),
+        "retry_count": max(len(attempted) - 1, 0),
+        "final_gate_status": gate_response.get("status"),
+        "selected_model": gate_response.get("model_id"),
     }
 
     log_fn = logger.info if gate_response.get("status") == "accepted" else logger.warning
@@ -547,6 +699,7 @@ def _recent_meta(
     size_bytes: Optional[int],
     request_id: Optional[str],
 ) -> Dict[str, Any]:
+    attempted = gate_response.get("attempted_models") or []
     return {
         "timestamp": time.time(),
         "request_id": request_id or uuid.uuid4().hex,
@@ -559,5 +712,6 @@ def _recent_meta(
         "image_size_bytes": size_bytes,
         "content_type": content_type,
         "filename": filename,
+        "attempted_models": attempted,
     }
 

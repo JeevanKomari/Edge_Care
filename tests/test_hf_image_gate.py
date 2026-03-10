@@ -96,7 +96,7 @@ def test_fail_open_on_timeout(monkeypatch):
     assert result["status"] == "fail_open"
     assert result["accepted"] is True
     assert "timeout" in result["reasons"][0].lower()
-    assert "TIMEOUT" in result["reason_codes"]
+    assert "GATE_TIMEOUT" in result["reason_codes"]
 
 
 def test_zero_shot_called_without_timeout_kw(monkeypatch):
@@ -124,6 +124,110 @@ def test_zero_shot_called_without_timeout_kw(monkeypatch):
     assert "timeout" not in stub.called_kwargs
     assert stub.called_kwargs["model"] == hf_image_gate.load_gate_config().model_id
     assert result["status"] in ("accepted", "rejected")
+
+
+def _stub_success_scores(candidate_labels):
+    return [
+        {"label": candidate_labels[0], "score": 0.75},
+        {"label": "a non-skin object", "score": 0.1},
+    ]
+
+
+def test_fallback_first_model_unavailable_then_success(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+    monkeypatch.setenv("HF_MODEL_ID", "modelA")
+    monkeypatch.setenv("HF_GATE_FALLBACK_MODEL_ID", "modelB")
+    monkeypatch.setenv("HF_GATE_SECOND_FALLBACK_MODEL_ID", "modelC")
+
+    class StubClient:
+        def __init__(self):
+            self.calls = []
+
+        def zero_shot_image_classification(self, image, candidate_labels=None, labels=None, model=None):
+            self.calls.append(model)
+            if model == "modelA":
+                raise StopIteration()
+            return _stub_success_scores(candidate_labels or labels)
+
+    stub = StubClient()
+    monkeypatch.setattr(hf_image_gate, "_get_client", lambda cfg: stub)
+    result = run_image_gate(b"abc", filename="photo.png", content_type="image/png", request_id="req-fb1")
+    assert result["status"] in ("accepted", "rejected")
+    assert result["model_id"] == "modelB"
+    assert result["attempted_models"] == ["modelA", "modelB"]
+    assert result["provider_unavailable_models"] == ["modelA"]
+    snap = gate_metrics_snapshot()
+    assert snap["model_usage"].get("modelB") == 1
+
+
+def test_second_fallback_used(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+    monkeypatch.setenv("HF_MODEL_ID", "modelA")
+    monkeypatch.setenv("HF_GATE_FALLBACK_MODEL_ID", "modelB")
+    monkeypatch.setenv("HF_GATE_SECOND_FALLBACK_MODEL_ID", "modelC")
+
+    class StubClient:
+        def __init__(self):
+            self.calls = []
+
+        def zero_shot_image_classification(self, image, candidate_labels=None, labels=None, model=None):
+            self.calls.append(model)
+            if model in ("modelA", "modelB"):
+                raise StopIteration()
+            return _stub_success_scores(candidate_labels or labels)
+
+    stub = StubClient()
+    monkeypatch.setattr(hf_image_gate, "_get_client", lambda cfg: stub)
+    result = run_image_gate(b"abc", filename="photo.png", content_type="image/png", request_id="req-fb2")
+    assert result["model_id"] == "modelC"
+    assert result["attempted_models"] == ["modelA", "modelB", "modelC"]
+    assert result["provider_unavailable_models"] == ["modelA", "modelB"]
+    snap = gate_metrics_snapshot()
+    assert snap["model_usage"].get("modelC") == 1
+
+
+def test_all_models_unavailable_fail_open(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+    monkeypatch.setenv("HF_MODEL_ID", "modelA")
+    monkeypatch.setenv("HF_GATE_FALLBACK_MODEL_ID", "modelB")
+    monkeypatch.setenv("HF_GATE_SECOND_FALLBACK_MODEL_ID", "modelC")
+
+    class StubClient:
+        def zero_shot_image_classification(self, image, candidate_labels=None, labels=None, model=None):
+            raise StopIteration()
+
+    monkeypatch.setattr(hf_image_gate, "_get_client", lambda cfg: StubClient())
+    result = run_image_gate(b"abc", filename="photo.png", content_type="image/png", request_id="req-failall")
+    assert result["status"] == "fail_open"
+    assert set(result["provider_unavailable_models"]) == {"modelA", "modelB", "modelC"}
+    assert "PROVIDER_UNAVAILABLE" in result["reason_codes"]
+
+
+def test_model_chain_dedup(monkeypatch):
+    reset_gate_metrics()
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+    monkeypatch.setenv("HF_MODEL_ID", "same")
+    monkeypatch.setenv("HF_GATE_FALLBACK_MODEL_ID", "same")
+    monkeypatch.setenv("HF_GATE_SECOND_FALLBACK_MODEL_ID", "other")
+
+    class StubClient:
+        def __init__(self):
+            self.calls = []
+
+        def zero_shot_image_classification(self, image, candidate_labels=None, labels=None, model=None):
+            self.calls.append(model)
+            if model == "same":
+                return _stub_success_scores(candidate_labels or labels)
+            return _stub_success_scores(candidate_labels or labels)
+
+    stub = StubClient()
+    monkeypatch.setattr(hf_image_gate, "_get_client", lambda cfg: stub)
+    result = run_image_gate(b"abc", filename="photo.png", content_type="image/png", request_id="req-dedup")
+    assert result["attempted_models"] == ["same", "other"]
+    assert result["model_id"] == "same"
 
 
 def test_gate_disabled(monkeypatch):
