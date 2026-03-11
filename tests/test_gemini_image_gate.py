@@ -480,7 +480,7 @@ def test_triage_urgent_high_severity(monkeypatch):
         "accepted": True,
         "model_id": "gemini-stub",
         "latency_ms": 1200,
-        "top_label": "clear_or_normal_skin",
+        "top_label": "rash_like_skin",
         "top_score": 0.9,
         "scores": [],
         "reasons": [],
@@ -509,6 +509,127 @@ def test_triage_urgent_high_severity(monkeypatch):
     assert triage["triage_level"] == "urgent_attention"
     assert "high_severity_confidence" in triage["red_flags"]
 
+def test_clear_skin_gate_suppresses_image_analysis(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 800,
+        "top_label": "clear_or_normal_skin",
+        "top_score": 0.95,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    body = resp.json()["ml_analysis"]
+    assert body["image_analysis_suppressed"] is True
+    assert body["disease_display"] == "Uncertain"
+    assert body["severity_display"] == "Uncertain"
+    assert body["should_suppress_disease_display"] is True
+    assert body["should_suppress_hard_severity"] is True
+    assert body["patient_guidance"]["urgent_warning"] is False
+    assert body["triage"]["triage_level"] == "self_care"
+
+
+def test_visible_rash_not_suppressed(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 600,
+        "top_label": "rash_like_skin",
+        "top_score": 0.92,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "moderate",
+                "confidence": 0.8,
+                "all_probabilities": {"mild": 0.1, "moderate": 0.8, "severe": 0.1},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {
+            "status": "classified",
+            "predicted_class": "eczema",
+            "confidence": 0.82,
+            "top_predictions": [{"label": "eczema", "score": 0.82}, {"label": "urticaria", "score": 0.12}],
+            "all_probabilities": {"eczema": 0.82, "urticaria": 0.12},
+        },
+    )
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    body = resp.json()["ml_analysis"]
+    assert body["image_analysis_suppressed"] is False
+    assert body["disease_display"] != "Uncertain"
+    assert body["should_suppress_disease_display"] is False
+    assert body["severity_display"] == "moderate"
+    assert body["should_suppress_hard_severity"] is False
+
+
+def test_low_confidence_severity_sets_uncertain_display(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 700,
+        "top_label": "rash_like_skin",
+        "top_score": 0.91,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "mild",
+                "confidence": 0.45,
+                "all_probabilities": {"mild": 0.45, "moderate": 0.42, "severe": 0.13},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {
+            "status": "classified",
+            "predicted_class": "urticaria",
+            "confidence": 0.7,
+            "top_predictions": [{"label": "urticaria", "score": 0.7}],
+            "all_probabilities": {"urticaria": 0.7},
+        },
+    )
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    body = resp.json()["ml_analysis"]
+    assert body["image_analysis_suppressed"] is False
+    assert body["severity_display"] == "Uncertain"
+    assert body["should_suppress_hard_severity"] is True
 
 def test_synonym_normalization_ringworm(monkeypatch):
     from app.ml import disease_taxonomy

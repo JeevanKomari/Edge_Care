@@ -19,6 +19,11 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "edgecare_6class_v1")
 
+# Clear skin gate controls
+CLEAR_SKIN_LABEL = "clear_or_normal_skin"
+CLEAR_SKIN_SUPPRESSION_THRESHOLD = float(os.getenv("CLEAR_SKIN_SUPPRESSION_THRESHOLD", "0.90"))
+RUN_SUPPRESSED_IMAGE_MODELS = os.getenv("RUN_SUPPRESSED_IMAGE_MODELS", "false").lower() in ("1", "true", "yes", "y")
+
 # ============================================================
 # 1) Existing Severity Model (mild/moderate/severe) -- unchanged
 # ============================================================
@@ -399,37 +404,56 @@ def analyze_image(file, file_bytes: bytes | None = None):
         logger.info("quality_poor", extra={"quality": quality_result})
     gate_result["quality"] = quality_result
 
-    # Severity retains original normalization (/255). Disease can toggle via env for mismatch debug.
-    severity_input = preprocess_image_224(image, normalize=True)
-    disease_input = preprocess_image_224(image, normalize=DISEASE_TFLITE_NORMALIZE)
+    gate_top_label = gate_result.get("top_label")
+    gate_top_score = gate_result.get("top_score") or 0.0
+    clear_skin_suppressed = (gate_top_label == CLEAR_SKIN_LABEL) and (gate_top_score >= CLEAR_SKIN_SUPPRESSION_THRESHOLD)
+    suppression_reason = "No obvious rash detected in image" if clear_skin_suppressed else None
+    image_assessment_display = "No obvious rash detected" if clear_skin_suppressed else "Image processed"
+    should_run_models = (not clear_skin_suppressed) or RUN_SUPPRESSED_IMAGE_MODELS
 
-    severity_result, severity_err = _predict_severity(severity_input)
-    if severity_err:
-        return {
-            "success": False,
-            "image_gate": gate_result,
-            "ml_analysis": None,
-            "message": severity_err.get("error", "Severity model unavailable"),
+    # Severity retains original normalization (/255). Disease can toggle via env for mismatch debug.
+    severity_input = preprocess_image_224(image, normalize=True) if should_run_models else None
+    disease_input = preprocess_image_224(image, normalize=DISEASE_TFLITE_NORMALIZE) if should_run_models else None
+
+    if should_run_models:
+        severity_result, severity_err = _predict_severity(severity_input)
+        if severity_err:
+            return {
+                "success": False,
+                "image_gate": gate_result,
+                "ml_analysis": None,
+                "message": severity_err.get("error", "Severity model unavailable"),
+            }
+    else:
+        severity_result = {
+            "predicted_class": "suppressed",
+            "confidence": 0.0,
+            "all_probabilities": {"mild": 0.0, "moderate": 0.0, "severe": 0.0},
+            "severity_status": "suppressed",
+            "severity_uncertain": True,
+            "confidence_band": "low",
+            "suppressed_by_gate": True,
         }
+        severity_err = None
 
     # Severity uncertainty rule
     sev_probs = severity_result.get("all_probabilities", {}) if isinstance(severity_result, dict) else {}
     max_conf = max(sev_probs.values()) if sev_probs else 0.0
     sorted_sev = sorted(sev_probs.items(), key=lambda x: x[1], reverse=True)
-    top1 = sorted_sev[0][1] if sorted_sev else 0.0
-    top2 = sorted_sev[1][1] if len(sorted_sev) > 1 else 0.0
-    severity_uncertain = (max_conf < 0.40) or ((top1 - top2) < 0.08)
+    sev_top1 = sorted_sev[0][1] if sorted_sev else 0.0
+    sev_top2 = sorted_sev[1][1] if len(sorted_sev) > 1 else 0.0
+    severity_uncertain = (max_conf < 0.40) or ((sev_top1 - sev_top2) < 0.08)
     severity_status = "uncertain" if severity_uncertain else severity_result.get("predicted_class")
-    if top1 >= 0.7:
+    if sev_top1 >= 0.7:
         sev_band = "high"
-    elif top1 >= 0.5:
+    elif sev_top1 >= 0.5:
         sev_band = "medium"
     else:
         sev_band = "low"
     severity_result["severity_status"] = severity_status
     severity_result["severity_uncertain"] = severity_uncertain
     severity_result["confidence_band"] = sev_band
-    if severity_uncertain:
+    if severity_uncertain and should_run_models:
         severity_result["warning"] = "Severity confidence is low; classification uncertain."
         gemini_metrics.inc_severity_uncertain()
         logger.info(
@@ -443,51 +467,109 @@ def analyze_image(file, file_bytes: bytes | None = None):
             },
         )
 
-    disease_result = _predict_disease(disease_input)
+    if should_run_models:
+        disease_result = _predict_disease(disease_input)
+    else:
+        disease_result = {
+            "status": "suppressed",
+            "predicted_class": "suppressed",
+            "confidence": 0.0,
+            "uncertain": True,
+            "top_predictions": [],
+            "all_probabilities": {},
+            "suppressed_by_gate": True,
+            "message": "Image analysis suppressed by clear-skin gate.",
+        }
+
     # Disease uncertainty / ambiguity
-    try:
-        top_preds = disease_result.get("top_predictions", [])
-        top1 = top_preds[0]["score"] if top_preds else 0.0
-        top2 = top_preds[1]["score"] if len(top_preds) > 1 else 0.0
-        disease_status = "classified"
-        ambiguous = False
-        if (top1 < 0.55) or ((top1 - top2) < 0.15):
-            disease_status = "uncertain"
-            ambiguous = (top1 - top2) < 0.15
-            gemini_metrics.inc_disease_uncertain()
-        if top1 >= 0.75:
-            disease_band = "high"
-        elif top1 >= 0.55:
-            disease_band = "medium"
-        else:
-            disease_band = "low"
-        disease_result["disease_status"] = disease_status
-        disease_result["ambiguous"] = ambiguous
-        disease_result["confidence_band"] = disease_band
-        disease_result["differential_diagnoses"] = top_preds[:3]
-        # Normalize labels to canonical taxonomy for all outputs
-        disease_result["top_predictions"] = normalize_predictions(top_preds)
-        disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
-        pred_label = disease_result.get("predicted_class")
-        canonical_pc, display_pc = normalize_condition(pred_label)
-        if canonical_pc:
-            disease_result["canonical_label"] = canonical_pc
-        if display_pc:
-            disease_result["display_name"] = display_pc
-        top1_label = top_preds[0]["label"] if top_preds else pred_label
-        canonical, display = normalize_condition(top1_label)
-        # Prefer canonical/display for primary prediction if available
-        if canonical and not disease_result.get("canonical_label"):
-            disease_result["canonical_label"] = canonical
-        if display and not disease_result.get("display_name"):
-            disease_result["display_name"] = display
-        if display_pc:
-            disease_result["predicted_class_display"] = display_pc
-    except Exception:
-        pass
+    if disease_result.get("status") not in ("suppressed", "disabled"):
+        try:
+            top_preds = disease_result.get("top_predictions", [])
+            top1 = top_preds[0]["score"] if top_preds else 0.0
+            top2 = top_preds[1]["score"] if len(top_preds) > 1 else 0.0
+            disease_status = "classified"
+            ambiguous = False
+            if (top1 < 0.55) or ((top1 - top2) < 0.15):
+                disease_status = "uncertain"
+                ambiguous = (top1 - top2) < 0.15
+                gemini_metrics.inc_disease_uncertain()
+            if top1 >= 0.75:
+                disease_band = "high"
+            elif top1 >= 0.55:
+                disease_band = "medium"
+            else:
+                disease_band = "low"
+            disease_result["disease_status"] = disease_status
+            disease_result["ambiguous"] = ambiguous
+            disease_result["confidence_band"] = disease_band
+            disease_result["differential_diagnoses"] = top_preds[:3]
+            # Normalize labels to canonical taxonomy for all outputs
+            disease_result["top_predictions"] = normalize_predictions(top_preds)
+            disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
+            pred_label = disease_result.get("predicted_class")
+            canonical_pc, display_pc = normalize_condition(pred_label)
+            if canonical_pc:
+                disease_result["canonical_label"] = canonical_pc
+            if display_pc:
+                disease_result["display_name"] = display_pc
+            top1_label = top_preds[0]["label"] if top_preds else pred_label
+            canonical, display = normalize_condition(top1_label)
+            # Prefer canonical/display for primary prediction if available
+            if canonical and not disease_result.get("canonical_label"):
+                disease_result["canonical_label"] = canonical
+            if display and not disease_result.get("display_name"):
+                disease_result["display_name"] = display
+            if display_pc:
+                disease_result["predicted_class_display"] = display_pc
+        except Exception:
+            pass
+
+    # Normalized display fields
+    should_suppress_disease_display = clear_skin_suppressed
+    should_suppress_hard_severity = clear_skin_suppressed
+
+    disease_conf = disease_result.get("confidence", 0.0) if isinstance(disease_result, dict) else 0.0
+    disease_status = disease_result.get("disease_status") or disease_result.get("status") if isinstance(disease_result, dict) else None
+    if disease_status in ("uncertain", "disabled") or disease_result.get("uncertain"):
+        should_suppress_disease_display = True
+    if disease_conf < 0.55:
+        should_suppress_disease_display = True
+
+    severity_conf = severity_result.get("confidence", 0.0) if isinstance(severity_result, dict) else 0.0
+    if severity_result.get("severity_uncertain") or severity_conf < 0.5 or ((sev_top1 - sev_top2) < 0.08):
+        should_suppress_hard_severity = True
+
+    disease_display = (
+        disease_result.get("display_name")
+        or disease_result.get("predicted_class_display")
+        or disease_result.get("predicted_class")
+        or "Uncertain"
+    )
+    severity_display = severity_result.get("predicted_class") or "Uncertain"
+
+    if should_suppress_disease_display:
+        disease_display = "Uncertain"
+    if should_suppress_hard_severity:
+        severity_display = "Uncertain"
+
+    if not clear_skin_suppressed:
+        if gate_top_label == "rash_like_skin":
+            image_assessment_display = "Possible rash detected"
+        elif gate_top_label:
+            image_assessment_display = gate_top_label.replace("_", " ")
 
     ml_payload = dict(severity_result)
     ml_payload["disease"] = disease_result
+    ml_payload["image_analysis_suppressed"] = clear_skin_suppressed
+    ml_payload["suppression_reason"] = suppression_reason
+    ml_payload["disease_display"] = disease_display
+    ml_payload["severity_display"] = severity_display
+    ml_payload["should_suppress_disease_display"] = should_suppress_disease_display
+    ml_payload["should_suppress_hard_severity"] = should_suppress_hard_severity
+    ml_payload["image_assessment_display"] = image_assessment_display
+
+    # Provide explicit raw section for debugging / logging
+    ml_payload["raw_outputs"] = {"severity": severity_result, "disease": disease_result}
 
     # Triage rules
     triage = {
@@ -496,26 +578,30 @@ def analyze_image(file, file_bytes: bytes | None = None):
         "needs_clinician_review": False,
     }
     quality = gate_result.get("quality", {})
-    if quality.get("quality_status") == "poor":
-        triage.update({"triage_level": "routine_review", "needs_clinician_review": True})
-        triage["red_flags"].append("poor_image_quality")
-        gemini_metrics.inc_priority_review()
-    gate_top = gate_result.get("top_label")
-    if gate_top == "rash_like_skin":
-        triage["triage_level"] = "priority_review"
-        triage["needs_clinician_review"] = True
-        gemini_metrics.inc_priority_review()
-    severity_cls = severity_result.get("predicted_class")
-    if severity_cls == "severe" and not severity_result.get("severity_uncertain"):
-        triage["triage_level"] = "priority_review"
-        triage["needs_clinician_review"] = True
-        gemini_metrics.inc_priority_review()
-        if severity_result.get("confidence", 0) >= 0.8:
-            triage["triage_level"] = "urgent_attention"
-            triage["red_flags"].append("high_severity_confidence")
+
+    if clear_skin_suppressed:
+        triage["suppressed_by_gate"] = True
+    else:
+        if quality.get("quality_status") == "poor":
+            triage.update({"triage_level": "routine_review", "needs_clinician_review": True})
+            triage["red_flags"].append("poor_image_quality")
+            gemini_metrics.inc_priority_review()
+        gate_top = gate_result.get("top_label")
+        if gate_top == "rash_like_skin":
+            triage["triage_level"] = "priority_review"
             triage["needs_clinician_review"] = True
-            gemini_metrics.inc_urgent_attention()
-            logger.warning("triage_escalation", extra={"triage": triage})
+            gemini_metrics.inc_priority_review()
+        severity_cls = severity_result.get("predicted_class")
+        if severity_cls == "severe" and not severity_result.get("severity_uncertain"):
+            triage["triage_level"] = "priority_review"
+            triage["needs_clinician_review"] = True
+            gemini_metrics.inc_priority_review()
+            if severity_result.get("confidence", 0) >= 0.8:
+                triage["triage_level"] = "urgent_attention"
+                triage["red_flags"].append("high_severity_confidence")
+                triage["needs_clinician_review"] = True
+                gemini_metrics.inc_urgent_attention()
+                logger.warning("triage_escalation", extra={"triage": triage})
     ml_payload["triage"] = triage
 
     # Patient guidance
@@ -529,6 +615,14 @@ def analyze_image(file, file_bytes: bytes | None = None):
         guidance["next_step"] = "Please retake a clear, well-lit close-up image of the area."
     if triage["triage_level"] in ("priority_review", "urgent_attention"):
         guidance["next_step"] = "Seek clinician review promptly."
+    if clear_skin_suppressed:
+        guidance.update(
+            {
+                "summary": "No obvious rash detected from image. This is not a confirmed diagnosis.",
+                "next_step": "Monitor symptoms or retake a closer image only if a visible skin change is present.",
+                "urgent_warning": False,
+            }
+        )
     ml_payload["patient_guidance"] = guidance
 
     response = {
