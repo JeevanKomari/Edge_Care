@@ -538,6 +538,108 @@ def test_clear_skin_gate_suppresses_image_analysis(monkeypatch):
     assert body["triage"]["triage_level"] == "self_care"
 
 
+def test_clear_skin_score_085_suppresses(monkeypatch):
+    """Hard suppression should trigger at the lowered 0.85 threshold."""
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 500,
+        "top_label": "clear_or_normal_skin",
+        "top_score": 0.85,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    ml = resp.json()["ml_analysis"]
+    assert ml["image_analysis_suppressed"] is True
+    assert ml["suppression_reason"] == "No obvious rash detected in image"
+    assert ml["image_assessment_display"] == "No obvious rash detected"
+    assert ml["patient_guidance"]["urgent_warning"] is False
+    assert ml["patient_guidance"]["summary"].startswith("No obvious rash detected")
+
+
+def test_clear_skin_score_086_suppresses(monkeypatch):
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 400,
+        "top_label": "clear_or_normal_skin",
+        "top_score": 0.86,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    ml = resp.json()["ml_analysis"]
+    assert ml["image_analysis_suppressed"] is True
+    assert ml["should_suppress_disease_display"] is True
+    assert ml["should_suppress_hard_severity"] is True
+    assert ml["image_assessment_display"] == "No obvious rash detected"
+
+
+def test_clear_skin_084_runs_models_but_uncertain_display(monkeypatch):
+    """Below threshold, models run; displays remain uncertain and gate text is kept."""
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 700,
+        "top_label": "clear_or_normal_skin",
+        "top_score": 0.84,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "mild",
+                "confidence": 0.33,
+                "all_probabilities": {"mild": 0.33, "moderate": 0.34, "severe": 0.33},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {
+            "status": "classified",
+            "predicted_class": "eczema",
+            "confidence": 0.5,
+            "top_predictions": [{"label": "eczema", "score": 0.5}, {"label": "urticaria", "score": 0.45}],
+            "all_probabilities": {"eczema": 0.5, "urticaria": 0.45},
+        },
+    )
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    ml = resp.json()["ml_analysis"]
+    assert ml["image_analysis_suppressed"] is False
+    assert ml["disease_display"] == "Uncertain"
+    assert ml["severity_display"] == "Uncertain"
+    assert ml["image_assessment_display"] == "clear or normal skin"
+
+
 def test_visible_rash_not_suppressed(monkeypatch):
     client = TestClient(app)
     img_bytes = _make_image_bytes()
@@ -584,6 +686,52 @@ def test_visible_rash_not_suppressed(monkeypatch):
     assert body["should_suppress_disease_display"] is False
     assert body["severity_display"] == "moderate"
     assert body["should_suppress_hard_severity"] is False
+
+
+def test_rash_like_image_no_suppression_after_threshold_change(monkeypatch):
+    """Ensure rash-like images remain unsuppressed with updated clear-skin gate."""
+    client = TestClient(app)
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 650,
+        "top_label": "rash_like_skin",
+        "top_score": 0.88,
+        "scores": [],
+        "reasons": [],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *args, **kwargs: stub_gate)
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {
+                "predicted_class": "moderate",
+                "confidence": 0.77,
+                "all_probabilities": {"mild": 0.1, "moderate": 0.77, "severe": 0.13},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_disease",
+        lambda data: {
+            "status": "classified",
+            "predicted_class": "eczema",
+            "confidence": 0.81,
+            "top_predictions": [{"label": "eczema", "score": 0.81}],
+            "all_probabilities": {"eczema": 0.81},
+        },
+    )
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: False)
+
+    resp = client.post("/ml/analyze-image", files={"file": ("img.png", img_bytes, "image/png")})
+    ml = resp.json()["ml_analysis"]
+    assert ml["image_analysis_suppressed"] is False
+    assert ml["image_assessment_display"] == "Possible rash detected"
 
 
 def test_low_confidence_severity_sets_uncertain_display(monkeypatch):

@@ -21,7 +21,10 @@ EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "edgecare_6class_v1")
 
 # Clear skin gate controls
 CLEAR_SKIN_LABEL = "clear_or_normal_skin"
-CLEAR_SKIN_SUPPRESSION_THRESHOLD = float(os.getenv("CLEAR_SKIN_SUPPRESSION_THRESHOLD", "0.90"))
+# Hard suppression threshold for obvious clear/normal skin
+CLEAR_SKIN_SUPPRESSION_THRESHOLD = float(os.getenv("CLEAR_SKIN_SUPPRESSION_THRESHOLD", "0.85"))
+# Display normalization threshold to keep patient wording consistent
+CLEAR_SKIN_DISPLAY_THRESHOLD = 0.85
 RUN_SUPPRESSED_IMAGE_MODELS = os.getenv("RUN_SUPPRESSED_IMAGE_MODELS", "false").lower() in ("1", "true", "yes", "y")
 
 # ============================================================
@@ -557,6 +560,15 @@ def analyze_image(file, file_bytes: bytes | None = None):
             image_assessment_display = "Possible rash detected"
         elif gate_top_label:
             image_assessment_display = gate_top_label.replace("_", " ")
+
+    # Normalized benign-clear display even when models run and outputs are uncertain
+    if (
+        gate_top_label == CLEAR_SKIN_LABEL
+        and gate_top_score >= CLEAR_SKIN_DISPLAY_THRESHOLD
+        and severity_display == "Uncertain"
+        and disease_display == "Uncertain"
+    ):
+        image_assessment_display = "No obvious rash detected"
 
     ml_payload = dict(severity_result)
     ml_payload["disease"] = disease_result
