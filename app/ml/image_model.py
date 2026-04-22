@@ -405,7 +405,11 @@ def analyze_image(file, file_bytes: Optional[bytes] = None):
             "message": f"Failed to read image: {e}",
         }
 
-    if is_image_blurry(image):
+    gate_top_label = gate_result.get("top_label")
+    gate_top_score = gate_result.get("top_score") or 0.0
+    high_confidence_skin_concern = gate_top_label == "rash_like_skin" and gate_top_score >= 0.85
+
+    if is_image_blurry(image) and not high_confidence_skin_concern:
         return {
             "success": False,
             "image_gate": gate_result,
@@ -419,8 +423,6 @@ def analyze_image(file, file_bytes: Optional[bytes] = None):
         logger.info("quality_poor", extra={"quality": quality_result})
     gate_result["quality"] = quality_result
 
-    gate_top_label = gate_result.get("top_label")
-    gate_top_score = gate_result.get("top_score") or 0.0
     clear_skin_suppressed = (gate_top_label == CLEAR_SKIN_LABEL) and (gate_top_score >= CLEAR_SKIN_SUPPRESSION_THRESHOLD)
     suppression_reason = "No obvious rash detected in image" if clear_skin_suppressed else None
     image_assessment_display = "No obvious rash detected" if clear_skin_suppressed else "Image processed"

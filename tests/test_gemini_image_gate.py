@@ -430,6 +430,61 @@ def test_endpoint_displays_provisional_gemini_disease(monkeypatch):
     assert body["ml_analysis"]["should_suppress_disease_display"] is False
 
 
+def test_high_confidence_skin_gate_bypasses_blur_hard_reject(monkeypatch):
+    img_bytes = _make_image_bytes()
+    stub_gate = {
+        "enabled": True,
+        "status": "accepted",
+        "accepted": True,
+        "model_id": "gemini-stub",
+        "latency_ms": 10,
+        "top_label": "rash_like_skin",
+        "top_score": 0.95,
+        "scores": [],
+        "reasons": ["Pigmented lesion visible."],
+        "thresholds": {},
+    }
+    monkeypatch.setattr("app.ml.image_model.run_image_gate", lambda *a, **k: stub_gate)
+    monkeypatch.setattr("app.ml.image_model.is_image_blurry", lambda img: True)
+    monkeypatch.setattr(
+        "app.ml.image_model.assess_image_quality",
+        lambda img: {"quality_status": "borderline", "quality_score": 0.6, "quality_flags": ["blurry"], "retake_required": False},
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model.run_disease_identifier",
+        lambda *a, **k: {
+            "status": "classified",
+            "disease_status": "classified",
+            "source": "gemini",
+            "predicted_class": "melanoma",
+            "confidence": 0.8,
+            "display_name": "Melanoma / Nevi",
+            "canonical_label": "Melanoma Skin Cancer Nevi and Moles",
+            "top_predictions": [{"label": "melanoma", "score": 0.8}],
+            "differential_diagnoses": [{"label": "mole"}],
+            "all_probabilities": {},
+            "uncertain": False,
+            "displayable": True,
+            "ambiguous": False,
+        },
+    )
+    monkeypatch.setattr(
+        "app.ml.image_model._predict_severity",
+        lambda data: (
+            {"predicted_class": "moderate", "confidence": 0.72, "all_probabilities": {"mild": 0.1, "moderate": 0.72, "severe": 0.18}},
+            None,
+        ),
+    )
+
+    resp = _post_analyze_image(img_bytes)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["ml_analysis"]["disease"]["source"] == "gemini"
+    assert body["ml_analysis"]["disease_display"] == "Melanoma / Nevi"
+    assert body["image_gate"]["quality"]["quality_status"] == "borderline"
+
+
 def test_endpoint_skips_ml_when_gate_rejects(monkeypatch):
     img_bytes = _make_image_bytes()
     stub_gate = {
