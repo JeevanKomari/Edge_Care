@@ -547,6 +547,8 @@ def test_severity_uncertain_rule(monkeypatch):
     body = resp.json()
     assert body["ml_analysis"]["severity_uncertain"] is True
     assert body["ml_analysis"]["severity_status"] == "uncertain"
+    assert body["ml_analysis"]["severity_display"] == "Estimated mild (low confidence)"
+    assert body["ml_analysis"]["severity_estimate_display"] == "Estimated mild (low confidence)"
 
 
 def test_slow_gate_flag_via_endpoint(monkeypatch):
@@ -976,7 +978,7 @@ def test_rash_like_image_no_suppression_after_threshold_change(monkeypatch):
     assert ml["image_assessment_display"] == "Possible rash detected"
 
 
-def test_low_confidence_severity_sets_uncertain_display(monkeypatch):
+def test_low_confidence_severity_sets_estimate_display(monkeypatch):
     img_bytes = _make_image_bytes()
     stub_gate = {
         "enabled": True,
@@ -1017,7 +1019,8 @@ def test_low_confidence_severity_sets_uncertain_display(monkeypatch):
     resp = _post_analyze_image(img_bytes)
     body = resp.json()["ml_analysis"]
     assert body["image_analysis_suppressed"] is False
-    assert body["severity_display"] == "Uncertain"
+    assert body["severity_display"] == "Estimated mild (low confidence)"
+    assert body["severity_estimate_display"] == "Estimated mild (low confidence)"
     assert body["should_suppress_hard_severity"] is True
 
 def test_synonym_normalization_ringworm(monkeypatch):

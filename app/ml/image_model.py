@@ -582,11 +582,23 @@ def analyze_image(file, file_bytes: Optional[bytes] = None):
         or disease_result.get("predicted_class")
         or "Uncertain"
     )
+    severity_estimate_display = None
     severity_display = severity_result.get("predicted_class") or "Uncertain"
+    if (
+        gate_top_label == "rash_like_skin"
+        and severity_result.get("severity_uncertain")
+        and severity_result.get("predicted_class") not in (None, "suppressed")
+    ):
+        severity_estimate_display = f"Estimated {severity_result.get('predicted_class')} (low confidence)"
 
     if should_suppress_disease_display:
         disease_display = "Uncertain"
-    if should_suppress_hard_severity:
+    if clear_skin_suppressed and should_suppress_hard_severity:
+        severity_display = "Uncertain"
+        severity_estimate_display = None
+    elif should_suppress_hard_severity and severity_estimate_display:
+        severity_display = severity_estimate_display
+    elif should_suppress_hard_severity:
         severity_display = "Uncertain"
 
     if not clear_skin_suppressed:
@@ -610,6 +622,7 @@ def analyze_image(file, file_bytes: Optional[bytes] = None):
     ml_payload["suppression_reason"] = suppression_reason
     ml_payload["disease_display"] = disease_display
     ml_payload["severity_display"] = severity_display
+    ml_payload["severity_estimate_display"] = severity_estimate_display
     ml_payload["should_suppress_disease_display"] = should_suppress_disease_display
     ml_payload["should_suppress_hard_severity"] = should_suppress_hard_severity
     ml_payload["image_assessment_display"] = image_assessment_display
