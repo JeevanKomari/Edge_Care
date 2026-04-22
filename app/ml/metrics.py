@@ -1,10 +1,10 @@
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.services.gemini_image_gate import gate_metrics_snapshot
 
-STATIC_METRICS_CACHE: Dict[str, Any] | None = None
+STATIC_METRICS_CACHE: Optional[Dict[str, Any]] = None
 
 
 def _load_static_metrics() -> Dict[str, Any]:

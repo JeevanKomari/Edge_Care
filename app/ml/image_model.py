@@ -3,7 +3,7 @@ import json
 import os
 import uuid
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import cv2
 import numpy as np
@@ -11,6 +11,7 @@ from PIL import Image, UnidentifiedImageError
 import tensorflow as tf
 
 from app.services.gemini_image_gate import run_image_gate, metrics as gemini_metrics
+from app.services.gemini_disease_identifier import run_disease_identifier
 from app.ml.disease_taxonomy import normalize_condition, normalize_predictions
 
 tflite = tf.lite
@@ -59,6 +60,7 @@ DISEASE_CLASS_NAMES_PATH = os.path.join(EXPORTS_DIR, "class_names.json")
 DISEASE_TOP_K = 3
 UNCERTAIN_TOP1_THRESHOLD = 0.45
 UNCERTAIN_MARGIN_THRESHOLD = 0.08
+LEGACY_DISEASE_FALLBACK_ENABLED = os.getenv("LEGACY_DISEASE_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 
 # Toggle for disease preprocessing scale. True = /255 (current), False = raw 0-255
 DISEASE_TFLITE_NORMALIZE = os.getenv("DISEASE_TFLITE_NORMALIZE", "true").lower() in ("1", "true", "yes", "y")
@@ -307,7 +309,17 @@ def _predict_disease(input_data: np.ndarray):
 # ============================================================
 # Public API called by /ml/analyze-image
 # ============================================================
-def analyze_image(file, file_bytes: bytes | None = None):
+def _has_usable_gemini_disease(result: Dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("source") != "gemini":
+        return False
+    if result.get("status") in {"disabled", "unavailable", "error"}:
+        return False
+    return bool(result.get("predicted_class") or result.get("display_name"))
+
+
+def analyze_image(file, file_bytes: Optional[bytes] = None):
     """Run HF image gate first, then existing severity + disease pipeline."""
     request_id = uuid.uuid4().hex
     filename = getattr(file, "filename", None)
@@ -471,7 +483,16 @@ def analyze_image(file, file_bytes: bytes | None = None):
         )
 
     if should_run_models:
-        disease_result = _predict_disease(disease_input)
+        gemini_disease_result = run_disease_identifier(file_bytes, request_id=request_id)
+        if _has_usable_gemini_disease(gemini_disease_result):
+            disease_result = gemini_disease_result
+        elif LEGACY_DISEASE_FALLBACK_ENABLED and gemini_disease_result.get("status") in {"disabled", "unavailable", "error"}:
+            disease_result = _predict_disease(disease_input)
+            if isinstance(disease_result, dict):
+                disease_result["fallback_source"] = "legacy_tflite"
+                disease_result["primary_source_attempt"] = gemini_disease_result
+        else:
+            disease_result = gemini_disease_result
     else:
         disease_result = {
             "status": "suppressed",
@@ -481,20 +502,25 @@ def analyze_image(file, file_bytes: bytes | None = None):
             "top_predictions": [],
             "all_probabilities": {},
             "suppressed_by_gate": True,
+            "source": "gemini",
             "message": "Image analysis suppressed by clear-skin gate.",
         }
 
     # Disease uncertainty / ambiguity
-    if disease_result.get("status") not in ("suppressed", "disabled"):
+    if disease_result.get("status") not in ("suppressed", "disabled", "unavailable", "error"):
         try:
             top_preds = disease_result.get("top_predictions", [])
             top1 = top_preds[0]["score"] if top_preds else 0.0
             top2 = top_preds[1]["score"] if len(top_preds) > 1 else 0.0
-            disease_status = "classified"
-            ambiguous = False
-            if (top1 < 0.55) or ((top1 - top2) < 0.15):
+            disease_status = disease_result.get("status") if disease_result.get("source") == "gemini" else "classified"
+            ambiguous = bool(disease_result.get("ambiguous")) if disease_result.get("source") == "gemini" else False
+            if disease_result.get("source") != "gemini" and ((top1 < 0.55) or ((top1 - top2) < 0.15)):
                 disease_status = "uncertain"
                 ambiguous = (top1 - top2) < 0.15
+                gemini_metrics.inc_disease_uncertain()
+            elif disease_result.get("source") == "gemini" and disease_result.get("status") not in {"classified", "provisional"}:
+                disease_status = "uncertain"
+                ambiguous = bool(disease_result.get("ambiguous"))
                 gemini_metrics.inc_disease_uncertain()
             if top1 >= 0.75:
                 disease_band = "high"
@@ -505,25 +531,29 @@ def analyze_image(file, file_bytes: bytes | None = None):
             disease_result["disease_status"] = disease_status
             disease_result["ambiguous"] = ambiguous
             disease_result["confidence_band"] = disease_band
-            disease_result["differential_diagnoses"] = top_preds[:3]
-            # Normalize labels to canonical taxonomy for all outputs
-            disease_result["top_predictions"] = normalize_predictions(top_preds)
-            disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
-            pred_label = disease_result.get("predicted_class")
-            canonical_pc, display_pc = normalize_condition(pred_label)
-            if canonical_pc:
-                disease_result["canonical_label"] = canonical_pc
-            if display_pc:
-                disease_result["display_name"] = display_pc
-            top1_label = top_preds[0]["label"] if top_preds else pred_label
-            canonical, display = normalize_condition(top1_label)
-            # Prefer canonical/display for primary prediction if available
-            if canonical and not disease_result.get("canonical_label"):
-                disease_result["canonical_label"] = canonical
-            if display and not disease_result.get("display_name"):
-                disease_result["display_name"] = display
-            if display_pc:
-                disease_result["predicted_class_display"] = display_pc
+            if disease_result.get("source") != "gemini":
+                disease_result["differential_diagnoses"] = top_preds[:3]
+            elif not disease_result.get("differential_diagnoses"):
+                disease_result["differential_diagnoses"] = top_preds[:3]
+            if disease_result.get("source") != "gemini":
+                # Normalize labels to canonical taxonomy for all outputs
+                disease_result["top_predictions"] = normalize_predictions(top_preds)
+                disease_result["differential_diagnoses"] = normalize_predictions(disease_result["differential_diagnoses"])
+                pred_label = disease_result.get("predicted_class")
+                canonical_pc, display_pc = normalize_condition(pred_label)
+                if canonical_pc:
+                    disease_result["canonical_label"] = canonical_pc
+                if display_pc:
+                    disease_result["display_name"] = display_pc
+                top1_label = top_preds[0]["label"] if top_preds else pred_label
+                canonical, display = normalize_condition(top1_label)
+                # Prefer canonical/display for primary prediction if available
+                if canonical and not disease_result.get("canonical_label"):
+                    disease_result["canonical_label"] = canonical
+                if display and not disease_result.get("display_name"):
+                    disease_result["display_name"] = display
+                if display_pc:
+                    disease_result["predicted_class_display"] = display_pc
         except Exception:
             pass
 
@@ -533,9 +563,11 @@ def analyze_image(file, file_bytes: bytes | None = None):
 
     disease_conf = disease_result.get("confidence", 0.0) if isinstance(disease_result, dict) else 0.0
     disease_status = disease_result.get("disease_status") or disease_result.get("status") if isinstance(disease_result, dict) else None
-    if disease_status in ("uncertain", "disabled") or disease_result.get("uncertain"):
+    disease_displayable = bool(disease_result.get("displayable"))
+    if disease_status in ("disabled", "unavailable", "error") or (disease_status == "uncertain" and not disease_displayable):
         should_suppress_disease_display = True
-    if disease_conf < 0.55:
+    disease_display_threshold = 0.35 if disease_result.get("source") == "gemini" else 0.55
+    if disease_conf < disease_display_threshold and not disease_displayable:
         should_suppress_disease_display = True
 
     severity_conf = severity_result.get("confidence", 0.0) if isinstance(severity_result, dict) else 0.0

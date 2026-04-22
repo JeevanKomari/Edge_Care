@@ -297,7 +297,8 @@ def run_image_gate(image_bytes: bytes, filename: Optional[str] = None, content_t
                     metrics.inc_slow_gate()
 
                 status = resp.status_code
-                body_preview = resp.text[:1000] if cfg.debug else resp.text[:500]
+                raw_text = getattr(resp, "text", "") or ""
+                body_preview = raw_text[:1000] if cfg.debug else raw_text[:500]
                 log_safe(
                     logging.INFO,
                     "gemini_response",
